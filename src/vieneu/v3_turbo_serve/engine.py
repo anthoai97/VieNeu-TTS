@@ -8,7 +8,14 @@ advances B requests together:
 
 Finished requests are masked out (their last frame is kept) and the batch keeps
 running until all finish or ``max_new_frames``. Each request's codes are decoded
-to a waveform at the end. Pure PyTorch, runs on CUDA (or CPU).
+to a waveform at the end, several rows per codec call (``decode_rows``). Pure
+PyTorch, runs on CUDA (or CPU).
+
+Concurrent ``generate_batch`` calls (Gradio and servers call ``infer()`` from
+several threads) used to run one after another, each as its own small batch.
+They now go through ``_Coalescer``: calls that arrive while a run is in
+progress wait, and the next run takes every waiting call with the same
+sampling settings as one batch.
 """
 from __future__ import annotations
 
@@ -56,6 +63,132 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+# Codec tokens per code frame in its last (400 Hz) decoder stage: the
+# non-streaming decode builds a (tokens x tokens) attention mask per row.
+_CODEC_TOKENS_PER_FRAME = 32
+
+
+def decode_rows(tokenizer, codes: List[torch.Tensor], budget_mb: int = 1024) -> List[np.ndarray]:
+    """Mono float32 waveforms for many rows' codes ``(T_i, n_vq)``.
+
+    Same codec decode as one ``decode()`` per row (padding is masked, the
+    decoder is causal), but several rows per call. Rows are grouped longest
+    first so a group pads little, and a group stays under ``budget_mb`` of
+    attention mask (counted at 4 bytes per element; a 300-frame row is
+    ~370 MB, a 75-frame row ~23 MB).
+    """
+    out: List[Optional[np.ndarray]] = [None] * len(codes)
+    todo = []
+    for i, c in enumerate(codes):
+        if len(c):
+            todo.append(i)
+        else:
+            out[i] = np.zeros(0, dtype=np.float32)
+    todo.sort(key=lambda i: -len(codes[i]))
+    dev = next(tokenizer.parameters()).device
+    budget = max(1, int(budget_mb)) * 2**20
+    k = 0
+    while k < len(todo):
+        per_row = (len(codes[todo[k]]) * _CODEC_TOKENS_PER_FRAME) ** 2 * 4
+        n = max(1, budget // per_row)
+        group = todo[k:k + n]
+        k += len(group)
+        dec = tokenizer.batch_decode([codes[i].T.to(dev) for i in group])
+        lens = dec.audio_lengths.tolist()
+        audio = dec.audio.float().mean(1).cpu().numpy()
+        for j, i in enumerate(group):
+            out[i] = audio[j, :lens[j]].copy()
+    return out
+
+
+class _Call:
+    def __init__(self, key, items):
+        self.key, self.items = key, items
+        self.result = None
+        self.error: Optional[BaseException] = None
+        self.done = False
+
+
+class _Coalescer:
+    """Runs ``fn(items) -> results`` (one result per item, same order) for
+    concurrent callers. While a run is in progress new calls wait; the next
+    run takes the oldest waiting call plus every other waiting call with the
+    same key, up to ``max_items`` items. Each call gets its own slice back.
+
+    If a merged run raises an ``Exception``, its calls are re-run one by one,
+    so a caller's bad input fails that caller only.
+    """
+
+    def __init__(self, max_items: int):
+        self.max_items = max(1, int(max_items))
+        self._cv = threading.Condition()
+        self._queue: List[_Call] = []
+        self._busy = False
+        self.runs = 0   # runs made (tests / stats)
+
+    def run(self, key, items, fn):
+        call = _Call(key, list(items))
+        with self._cv:
+            self._queue.append(call)
+        while True:
+            with self._cv:
+                while self._busy and not call.done:
+                    self._cv.wait()
+                if call.done:
+                    break
+                batch = self._take()
+                self._busy = True
+            try:
+                self._execute(batch, fn)
+            finally:
+                with self._cv:
+                    for c in batch:
+                        c.done = True
+                    self._busy = False
+                    self._cv.notify_all()
+        if call.error is not None:
+            raise call.error
+        return call.result
+
+    def _take(self) -> List[_Call]:
+        first = self._queue[0]
+        batch, n = [], 0
+        for c in list(self._queue):
+            if c.key != first.key:
+                continue
+            if batch and n + len(c.items) > self.max_items:
+                break
+            batch.append(c)
+            n += len(c.items)
+        for c in batch:
+            self._queue.remove(c)
+        return batch
+
+    def _execute(self, batch: List[_Call], fn) -> None:
+        try:
+            self.runs += 1
+            out = fn([x for c in batch for x in c.items])
+        except Exception as e:   # noqa: BLE001 — isolate the caller whose input broke it
+            if len(batch) == 1:
+                batch[0].error = e
+                return
+            for c in batch:
+                try:
+                    self.runs += 1
+                    c.result = fn(c.items)
+                except Exception as e1:   # noqa: BLE001
+                    c.error = e1
+            return
+        except BaseException as e:   # interrupts / cancel hooks: everyone in the run hears it
+            for c in batch:
+                c.error = e
+            raise
+        i = 0
+        for c in batch:
+            c.result = out[i:i + len(c.items)]
+            i += len(c.items)
+
+
 class V3TurboBatchEngine:
     def __init__(self, tts):
         # tts: VieNeuTTSv3Turbo (provides prompt building, embeddings, heads, codec)
@@ -81,6 +214,11 @@ class V3TurboBatchEngine:
         # Called once per generated frame (both loops). A server sets it to
         # its cancel check; raising from it stops the batch within a frame.
         self.frame_hook = None
+        # Concurrent generate_batch calls share runs (module doc). The owner sets
+        # ``coalescer.max_items`` to its batch-size ceiling.
+        self.coalescer = _Coalescer(_env_int("VIENEU_MAX_BATCH_ROWS", 32))
+        # Attention-mask budget of one batched codec decode (decode_rows).
+        self.decode_budget_mb = _env_int("VIENEU_DECODE_BUDGET_MB", 1024)
 
     def _get_graph(self, B, temperature, top_k, top_p):
         key = (B, round(temperature, 4), top_k, round(top_p, 4))
@@ -143,26 +281,42 @@ class V3TurboBatchEngine:
         It is ignored when ``repetition_penalty != 1.0`` (the penalty needs dynamic
         per-row history, which a static graph cannot hold).
         """
-        # Before any GPU work: a NaN baked into a graph is a device-side assert.
+        # Before any GPU work, in the caller's thread: a NaN baked into a graph is
+        # a device-side assert, and it must fail this call, not a merged run.
         temperature, top_k, top_p, repetition_penalty = check_sampling(
             temperature, top_k, top_p, repetition_penalty)
         # Fill in phonemes up front so the guard can size-check every row (and so
-        # retries don't re-phonemize).
+        # retries don't re-phonemize). Each row keeps its call's frame budget, so
+        # calls with different budgets can share a run.
         reqs = []
         for r in requests:
             if r.get("phonemes") is None:
                 from vieneu_utils.phonemize_text import phonemize_text_with_emotions
                 r = {**r, "phonemes": phonemize_text_with_emotions(r["text"])}
-            reqs.append(r)
+            reqs.append({**r, "_max_new_frames": int(max_new_frames)})
+        if not reqs:
+            return []
+        key = (round(temperature, 4), int(top_k), round(top_p, 4), round(repetition_penalty, 4),
+               int(repetition_window), bool(use_cudagraph), int(max_retries), bool(frame_cap))
+        return self.coalescer.run(key, reqs, lambda rows: self._run_batch(
+            rows, temperature=temperature, top_k=top_k, top_p=top_p,
+            repetition_penalty=repetition_penalty, repetition_window=repetition_window,
+            use_cudagraph=use_cudagraph, max_retries=max_retries, frame_cap=frame_cap,
+        ))
 
+    @torch.no_grad()
+    def _run_batch(self, reqs: List[dict], *, temperature, top_k, top_p, repetition_penalty,
+                   repetition_window, use_cudagraph, max_retries, frame_cap) -> List[np.ndarray]:
+        """One run of ``generate_batch`` over ``reqs`` (possibly several calls')."""
+        row_max = [r["_max_new_frames"] for r in reqs]
         sampling = dict(
             temperature=temperature, top_k=top_k, top_p=top_p,
             repetition_penalty=repetition_penalty, repetition_window=repetition_window,
-            max_new_frames=max_new_frames, use_cudagraph=use_cudagraph,
+            max_new_frames=max(row_max), use_cudagraph=use_cudagraph,
         )
         # Trần frame RIÊNG từng row (luôn > floor chặn-dưới nên không kích retry).
-        caps = ([min(max_new_frames, max_expected_frames(r["phonemes"])) for r in reqs]
-                if frame_cap else None)
+        caps = [min(m, max_expected_frames(r["phonemes"])) if frame_cap else m
+                for m, r in zip(row_max, reqs)]
         codes = self._generate_codes_batch(reqs, frame_caps=caps, **sampling)
 
         # Guard: re-run rows whose output is too short for their text.
@@ -175,9 +329,7 @@ class V3TurboBatchEngine:
                 f"⚠️ v3 Turbo batch: {len(bad)} chunk ngắn bất thường "
                 f"(rows {bad}) — đang sinh lại...")
             retry = self._generate_codes_batch(
-                [reqs[i] for i in bad],
-                frame_caps=[caps[i] for i in bad] if caps is not None else None,
-                **sampling)
+                [reqs[i] for i in bad], frame_caps=[caps[i] for i in bad], **sampling)
             for j, i in enumerate(bad):
                 if len(retry[j]) > len(codes[i]):
                     codes[i] = retry[j]
@@ -188,16 +340,16 @@ class V3TurboBatchEngine:
                     f"⚠️ v3 Turbo batch: rows {still_bad} vẫn ngắn hơn ngưỡng sau "
                     f"{max_retries} lần thử — giữ bản dài nhất.")
 
-        def _decode(c) -> np.ndarray:
-            return self.tts._decode_codes(c.cpu()) if len(c) else np.zeros(0, dtype=np.float32)
+        def _decode(rows) -> List[np.ndarray]:
+            return decode_rows(self.tts.audio_tokenizer, rows, self.decode_budget_mb)
 
-        wavs: List[np.ndarray] = [_decode(c) for c in codes]
+        wavs: List[np.ndarray] = _decode(codes)
 
         # Babble guard (đối xứng với guard "chunk câm" ở trên): row rất ngắn mà
         # "nói thêm" sau stop token trượt -> sinh lại row đó. Đây là tầng engine
         # nên mọi lối vào (SDK, Gradio, server) đều được che. Xem core_utils.babble_suspect.
         retries = int(getattr(self, "babble_retries", BABBLE_MAX_RETRIES))
-        if retries > 0 and caps is not None:
+        if retries > 0 and frame_cap:
             sr = int(getattr(self.tts, "sample_rate", 48_000))
             state = [babble_suspect(wavs[i], sr, reqs[i]["phonemes"], caps[i], len(codes[i]))
                      for i in range(len(reqs))]
@@ -209,8 +361,9 @@ class V3TurboBatchEngine:
                             f"— đang sinh lại ({attempt + 1}/{retries})...")
                 retry = self._generate_codes_batch(
                     [reqs[i] for i in bad], frame_caps=[caps[i] for i in bad], **sampling)
+                retry_wavs = _decode(retry)
                 for j, i in enumerate(bad):
-                    w2 = _decode(retry[j])
+                    w2 = retry_wavs[j]
                     cand = babble_suspect(w2, sr, reqs[i]["phonemes"], caps[i], len(retry[j]))
                     if babble_prefer(cand, state[i]):
                         codes[i], wavs[i], state[i] = retry[j], w2, cand

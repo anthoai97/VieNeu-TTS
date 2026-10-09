@@ -646,6 +646,10 @@ def load_model(backbone_choice: str, codec_choice: str, device_choice: str,
                     precision=v3_precision,
                     hf_token=custom_hf_token,
                 )
+                # GPU: capture the batch CUDA graphs now, not on the first click.
+                n_graphs = tts.warmup() if hasattr(tts, "warmup") else 0
+                if n_graphs:
+                    print(f"   🔥 Warmed up {n_graphs} CUDA graph(s)")
             elif "v2-Turbo" in backbone_choice:
                 # VieNeu v2 Turbo uses the dedicated backend
                 print("   ⚡ Mode: Turbo")

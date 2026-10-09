@@ -13,6 +13,7 @@ Tài liệu này mô tả server `apps/openai_speech.py` (endpoint `POST /v1/aud
 - [GPU: cơ chế streaming](#gpu-cơ-chế-streaming)
 - [GPU: số đo trên RTX 3060](#gpu-số-đo-trên-rtx-3060)
 - [GPU: chọn `max_streams` và quy đổi ra số người dùng](#gpu-chọn-max_streams-và-quy-đổi-ra-số-người-dùng)
+- [GPU: batch / offline (`infer`, `infer_batch`)](#gpu-batch--offline-infer-infer_batch)
 - [GPU: dự đoán cho các máy khác](#gpu-dự-đoán-cho-các-máy-khác)
 - [CPU: cơ chế streaming và số đo](#cpu-cơ-chế-streaming-và-số-đo)
 - [Tự đo trên máy của bạn](#tự-đo-trên-máy-của-bạn)
@@ -64,6 +65,10 @@ Biến môi trường:
 | `VIENEU_QUEUE_TIMEOUT` | 10 | Giây chờ tối đa trong hàng; hết → `429` |
 | `VIENEU_API_KEY` | (trống) | Nếu đặt, yêu cầu `Authorization: Bearer <key>`. Để trống mà `HOST` không phải loopback → cảnh báo lúc khởi động |
 | `VIENEU_WATERMARK` | 1 | Đóng watermark âm thanh (Perth) từng chunk |
+| `VIENEU_CODEC_GRAPH` | 1 | GPU: decode codec bằng `StreamCodec` (KV cache dạng ring + CUDA graph, xem bên dưới). `0` = `batch_decode` streaming của chính codec — đường đã dùng để đo các số liệu trong trang này |
+| `VIENEU_CODEC_DTYPE` | `fp32` | GPU: `bf16` / `fp16` chạy decoder của codec ở độ chính xác đó (quantizer vẫn fp32). Mặc định tắt cho tới khi kiểm xong chất lượng audio; `examples/bench_codec.py` in tương quan/SNR so với fp32 |
+| `VIENEU_CODEC_OVERLAP` | 0 | GPU: `1` chạy codec trên CUDA stream riêng trong khi vẫn sinh khung (audio của một block ra trễ một tick). Đo trước khi giữ |
+| `VIENEU_STREAM_MAX_LEN` | 2048 | GPU: số vị trí KV cache mỗi slot stream; mỗi khung đọc toàn bộ cho mọi slot. Một request cần prompt + trần khung + 2: `1024` đủ cho chunk 256 ký tự mặc định và giảm một nửa lượng đọc; request dài hơn sẽ bị từ chối |
 | `HOST` / `PORT` | `127.0.0.1` / 8000 | `HOST=0.0.0.0` để máy khác gọi được (các profile Docker đã đặt sẵn) — kèm `VIENEU_API_KEY` |
 
 Server chỉ chạy **một worker** (`uvicorn workers=1`): model và scheduler nằm trong tiến trình; GPU phục vụ nhiều luồng bằng batching bên trong chứ không bằng nhiều tiến trình. Muốn scale ngang thì chạy nhiều container, mỗi container một GPU.
@@ -176,7 +181,9 @@ Chi phí thực (RTX 3060, bf16):
 | Khung graph | 7 ms (B=1) · 8 (8) · 9 (16) · 10 (32) | Cho **toàn bộ** batch |
 | **Codec** (4 khung) | **~65 ms + ~2,5 ms × số slot đã cấp** | Không phụ thuộc số khung hay số row đang thực dùng; launch-bound |
 
-Điểm quan trọng: **codec là toàn bộ chi phí**, và chi phí ấy tỷ lệ với `max_streams` (số slot phiên codec giữ), không phải số luồng thực đang chạy. Vì thế `max_streams=32` làm cả một luồng đơn lẻ cũng chậm đi. Chế độ `use_cuda_graph` sẵn có của codec nhanh gấp 3 nhưng cho audio sai (tương quan 0,2 với decode thường) nên không dùng.
+Điểm quan trọng: **codec là toàn bộ chi phí**, và chi phí ấy tỷ lệ với `max_streams` (số slot phiên codec giữ), không phải số luồng thực đang chạy. Vì thế `max_streams=32` làm cả một luồng đơn lẻ cũng chậm đi. Chế độ `use_cuda_graph` sẵn có của codec nhanh gấp 3 nhưng cho audio sai (tương quan 0,2 với decode thường): session của nó giữ view vào buffer đầu ra của graph, nên một lần gọi 4 khung trả về khung cuối 4 lần.
+
+**Từ 2026-10 (`VIENEU_CODEC_GRAPH=1`, mặc định)** codec chạy qua `src/vieneu/v3_turbo_serve/codec_stream.py`: vẫn các lớp của codec, nhưng KV cache là ring ghi tại chỗ (session của codec chép lại toàn bộ cửa sổ attention của mọi lớp mỗi khung, cho mọi slot đã cấp — đó là ~2,5 ms mỗi slot) và một CUDA graph cho mỗi khung mã. Audio khớp decode thường tới ~1e-5 ở fp32. Các số liệu trong trang này đo **trước** thay đổi đó; tự so trên máy bằng `examples/bench_codec.py` (lời gọi codec cũ vs mới) và chạy các bench bên dưới với `VIENEU_CODEC_GRAPH=0` rồi `1`.
 
 Đường cũ (trước 15/09/2026): engine đơn không CUDA graph, TTFA 280–360 ms, giữ khoá cả lượt → 1 luồng, RTF 0,85.
 
@@ -277,6 +284,23 @@ Quy tắc: `max_streams` = số luồng **đồng thời** cao nhất bạn cầ
 
 ---
 
+## GPU: batch / offline (`infer`, `infer_batch`)
+
+`infer` / `infer_batch` (Web UI, SRT, script) chạy engine batch tĩnh (`src/vieneu/v3_turbo_serve/engine.py`): các chunk của văn bản dùng chung một CUDA graph mỗi khung, rồi codec đổi mã từng row thành audio.
+
+- **Các lời gọi đồng thời chạy chung.** Lời gọi tới khi một batch đang chạy sẽ chờ, và lượt sau gom mọi lời gọi đang chờ có cùng tham số sampling (temperature, top-k, top-p, penalty) thành một batch, tối đa `max_batch_size` row (`Vieneu(max_batch_size=...)`). Tham số khác nhau thì chạy lần lượt. Nếu lượt gộp bị lỗi, từng lời gọi được chạy lại riêng, nên input hỏng của một người chỉ làm hỏng lời gọi của người đó.
+- **Nhiều row được decode trong một lần gọi codec**, gom từ row dài nhất trong ngân sách `VIENEU_DECODE_BUDGET_MB` (mặc định 1024) cho attention mask — row 300 khung (24 s) tốn ~370 MB, row 75 khung ~23 MB. GPU nhỏ mà decode hết bộ nhớ thì hạ số này.
+- **Khởi động trước**: lần gọi đầu cho một kích thước batch mới phải capture CUDA graph (~0,5 s). `tts.warmup()` capture sẵn kích thước 1 và `max_batch_size`; Web UI gọi nó sau khi nạp v3 Turbo trên GPU.
+- **GPU lớn**: VRAM hiếm khi là giới hạn. `max_batch_size=64` (hoặc 128 cho văn bản dài) vừa card 16 GB — một graph batch 32 với cache 1024 vị trí giữ ~0,4 GB. Mỗi bộ tham số sampling giữ graph riêng; `VIENEU_FUSED_SAMPLINGS` (mặc định 2) là số bộ được giữ.
+
+| Biến | Mặc định | Ý nghĩa |
+|---|---|---|
+| `VIENEU_MAX_BATCH_ROWS` | 32 | Số row mỗi lượt gộp khi dùng engine không qua `Vieneu` (`Vieneu` đặt bằng `max_batch_size`) |
+| `VIENEU_DECODE_BUDGET_MB` | 1024 | Ngân sách attention mask cho một lần decode codec theo batch |
+| `VIENEU_FUSED_SAMPLINGS` | 2 | Số bộ tham số sampling được giữ CUDA graph |
+
+---
+
 ## GPU: dự đoán cho các máy khác
 
 **Chưa đo trên máy nào ngoài RTX 3060** — bảng dưới là suy luận từ cấu trúc chi phí, dùng để lập kế hoạch rồi kiểm chứng bằng phần [Tự đo](#tự-đo-trên-máy-của-bạn).
@@ -285,7 +309,7 @@ Ba điều rút ra từ số đo giúp dự đoán:
 
 1. **VRAM không phải giới hạn.** 16 luồng đỉnh 1,1 GB, 32 luồng 1,8 GB. Card 4 GB đủ cho 16 luồng, 6 GB đủ cho 32.
 2. **Giới hạn là chi phí "mỗi lời gọi" (launch-bound), không phải FLOPS.** Backbone 12 tầng 768 chiều và codec 11M tham số đều bé; thời gian là hàng trăm kernel launch nhỏ. Vì vậy GPU mạnh hơn nhiều (4090, A100) **không** cho TTFA thấp hơn nhiều; CPU host nhanh, driver, PCIe và việc không chia sẻ GPU với việc khác quan trọng ngang GPU.
-3. **Kiến trúc GPU ảnh hưởng qua dtype và CUDA graph.** Ampere trở lên (RTX 30/40, A-series) chạy bf16 như máy đo. Turing/Pascal (GTX 16, RTX 20, T4, GTX 10) không có bf16 → code tự chuyển **fp16**; đường này **chưa được kiểm chất lượng** (nguy cơ tràn số ở activation). CUDA graph cần driver CUDA ≥ 11, có trên mọi card từ Maxwell.
+3. **Kiến trúc GPU ảnh hưởng qua dtype và CUDA graph.** Ampere trở lên (RTX 30/40, A-series) chạy bf16 như máy đo. Turing/Volta/Pascal (GTX 16, RTX 20, T4, V100, GTX 10) không có bf16 gốc → `dtype="auto"` chạy model ở **fp32** (hàm kiểm bf16 mặc định của torch chấp nhận bf16 giả lập trên các card này; code chỉ nhận bf16 gốc). fp32 là lựa chọn an toàn ở đó; chưa có số liệu nào trong trang này đo với nó. CUDA graph cần driver CUDA ≥ 11, có trên mọi card từ Maxwell.
 
 | Máy | VRAM | Dự đoán TTFA 1 luồng | Dự đoán số luồng real-time | Ghi chú |
 |---|---|---|---|---|
@@ -293,9 +317,9 @@ Ba điều rút ra từ số đo giúp dự đoán:
 | RTX 3050 / 4060 8 GB, RTX 3060 Ti/4070 | 6–12 | 100–130 ms | 16, tối đa ~32 | Cùng thế hệ, launch-bound nên gần như bằng 3060; 4060 laptop bị power limit có thể chậm 10–20 % |
 | RTX 3050 laptop 4 GB, RTX A2000 | 4 | 120–160 ms | 8–12 (`max_streams=8`–`12`) | VRAM đủ; clock thấp và chia sẻ với hệ điều hành → giữ `max_streams` nhỏ |
 | RTX 4090 / A10 / L4 | 16–24 | 90–110 ms | 24–32 | Phần codec nhanh hơn, phần launch không; trần thực do CPU host |
-| T4 16 GB (cloud) | 16 | 150–220 ms | 8–12 | Turing → fp16 (chưa kiểm chất lượng); clock thấp; VM cloud thường CPU yếu → overhead launch tăng |
+| T4 16 GB (cloud) | 16 | 150–220 ms | 8–12 | Turing → model fp32; clock thấp; VM cloud thường CPU yếu → overhead launch tăng |
 | GTX 1660 / RTX 2060 6 GB | 6 | 140–200 ms | 8–12 | Như T4 nhưng desktop CPU nhanh hơn |
-| GTX 1650 4 GB, GTX 1050 Ti | 4 | 180–250 ms | 4–8 | fp16 (Pascal không có tensor core: codec fp32 chậm hơn ~1,5–2×) |
+| GTX 1650 4 GB, GTX 1050 Ti | 4 | 180–250 ms | 4–8 | model fp32 (không có bf16 gốc; Pascal không có tensor core) |
 | GPU < 4 GB | <4 | — | 2–4 hoặc chạy CPU | Cần `max_streams` ≤ 4 để cache tĩnh + codec vừa; không có lợi rõ so với CPU int8 |
 
 Cách đọc bảng: TTFA ≈ prefill (20–40 ms) + 2 khung graph (15–25 ms) + một lời gọi codec (60–120 ms tuỳ card/CPU host). Số luồng ≈ (80 ms − khung graph) / (chi phí codec ÷ 4 khung), giữ RTF ≤ 0,6–0,7 để còn biên.
@@ -352,7 +376,17 @@ uv run python examples/openai_speech_client.py --bench 16
 - Log server in mỗi request: `ttfa=… total=… audio=… rtf=… active=…`.
 - GPU: `nvidia-smi` khi bench để xem VRAM; `torch.cuda.max_memory_allocated()` trong tiến trình cho số chính xác hơn.
 
-Muốn đo sâu hơn (từng thành phần: prefill / khung / codec), xem docstring `src/vieneu/v3_turbo_serve/stream.py` và test `tests/fused/cases.py`.
+Muốn đo sâu hơn (từng thành phần: prefill / khung / codec), xem docstring `src/vieneu/v3_turbo_serve/stream.py` và test `tests/fused/cases.py`. Riêng lời gọi codec, đường cũ vs `StreamCodec`, theo `max_streams` và dtype (chỉ tải codec 88 MB):
+
+```bash
+uv run python examples/bench_codec.py --max-streams 8 16 32 64 --dtype fp32 bf16 --json codec.json
+```
+
+Thời gian một khung theo kích thước batch, prefill (HF vs prefill tĩnh mà scheduler dùng bây giờ) và stream trong tiến trình — chạy một lần cho mỗi thiết lập (`VIENEU_CODEC_GRAPH=0`, `VIENEU_CODEC_OVERLAP=1`, …) để so:
+
+```bash
+uv run python examples/bench_stream.py --json stream.json
+```
 
 ---
 
@@ -366,7 +400,7 @@ Muốn đo sâu hơn (từng thành phần: prefill / khung / codec), xem docstr
 | Tiếng đứt quãng ở client | Client không prebuffer, hoặc RTF > 1 (CPU fp32 nhiều request) | Prebuffer 150–300 ms (GPU) / ≥ 300 ms (CPU); CPU dùng int8, giữ 1–2 luồng |
 | Request đầu tiên sau khởi động chậm 1–2 s | Warm-up chưa xong | Server đã tự warm; chờ `/health` trả `ok` trước khi mở traffic |
 | Muốn tắt đường CUDA graph (gỡ lỗi) | — | `VIENEU_FUSED_FRAME=0` → `infer_stream` quay về engine đơn (1 luồng, ~300 ms) |
-| GPU Turing/Pascal, tiếng lạ | fp16 fallback chưa kiểm chứng | Thử `Vieneu(dtype="float32")` (chậm hơn ~1,5×) hoặc báo issue kèm mẫu |
+| GPU Turing/Volta/Pascal, chậm hoặc tiếng lạ | Trước 2026-10, `dtype="auto"` chọn bf16 giả lập trên các card này | Cập nhật, hoặc truyền `Vieneu(dtype="float32")`; vẫn lỗi thì báo issue kèm mẫu |
 | Cần mp3/opus | Chưa hỗ trợ | Đặt reverse proxy/ffmpeg phía trước, hoặc client nhận `pcm` rồi tự mã hoá; thêm ~20–40 ms trễ |
 | `repetition_window` khác mặc định không có tác dụng (GPU) | Cửa sổ phạt lặp là kích thước ring cố định của scheduler | Dùng `repetition_penalty` để chỉnh; window mặc định dùng chung |
 | Ngắt kết nối giữa chừng có tốn tài nguyên không? | Không | Đóng response → generator đóng → slot GPU được giải phóng ở tick kế tiếp (đã kiểm) |

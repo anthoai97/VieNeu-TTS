@@ -444,7 +444,10 @@ class VieNeuTTSv3Turbo:
 
     def _resolve_dtype(self, dtype: str) -> torch.dtype:
         if dtype == 'auto':
-            if self.device.type == 'cuda':
-                return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            # Native bf16 only (Ampere+). torch's default ``including_emulation=True``
+            # says yes on Turing/Volta too, which then ran bf16 without bf16 tensor
+            # cores. fp32 there: what ``_apply_dtype`` produced anyway for float16.
+            if self.device.type == 'cuda' and torch.cuda.is_bf16_supported(including_emulation=False):
+                return torch.bfloat16
             return torch.float32
         return {'float32': torch.float32, 'float16': torch.float16, 'bfloat16': torch.bfloat16}[dtype]

@@ -501,7 +501,19 @@ class V3TurboVieNeuTTS(BaseVieneuTTS):
             from .v3_turbo_serve import V3TurboBatchEngine
             self._batch_engine = V3TurboBatchEngine(self.engine)
             self._batch_engine.babble_retries = self.babble_retries
+            # Concurrent infer() calls are merged into runs of at most this many rows.
+            self._batch_engine.coalescer.max_items = self.max_batch_size
         return self._batch_engine
+
+    def warmup(self, batch_sizes: Optional[List[int]] = None) -> int:
+        """Capture the CUDA graphs ``infer`` / ``infer_batch`` will use, so the
+        first request does not pay ~0.5 s per batch size. Default sizes: 1 and
+        ``max_batch_size`` (default sampling settings). No-op on CPU/ONNX.
+        Returns how many graphs were captured."""
+        if not self._fused_available():
+            return 0
+        sizes = batch_sizes or (1, self.max_batch_size)
+        return self._get_batch_engine().warm_fused(batch_sizes=tuple(int(b) for b in sizes))
 
     def _fused_available(self) -> bool:
         """The batch engine runs frames as CUDA graphs here (see fused.py)."""

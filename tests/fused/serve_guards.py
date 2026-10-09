@@ -34,8 +34,13 @@ class FakeFrame:
 
     def __init__(self, model, B, max_len, *, repetition_window):
         self.B = B
-        self.bb = SimpleNamespace(layers=[0, 1])
+        self.bb = SimpleNamespace(layers=[0, 1], prefill=self.prefill)
+        self.kv_rows = None          # what prefill hands back per row (a test may break it)
         self.replay_error = None
+
+    def prefill(self, embeds):
+        rows = self.kv_rows if self.kv_rows is not None else [[_Any(), _Any()]] * len(embeds)
+        return [None] * len(embeds), rows, rows
 
     def admit(self, b, keys, values, h_last, spk, cap, **sampling):
         if spk == "bad-row":
@@ -56,16 +61,11 @@ class FakeBatchEngine:
         self.model = object()
         self.tts = SimpleNamespace(audio_tokenizer=SimpleNamespace(),
                                    _resolve_speaker_emb=lambda s: s)
-        self.bb = SimpleNamespace(prefill=self.prefill)
-        self.cache = SimpleNamespace(layers=[SimpleNamespace(keys=_Any(), values=_Any())] * 2)
 
     def _prompt_embeds(self, req):
         if req["phonemes"] == "bad-prompt":
             raise ValueError("ref_codes has the wrong shape")
         return _Any()
-
-    def prefill(self, embeds):
-        return [None] * len(embeds), self.cache, _Any(), None
 
 
 class _NoThread:
@@ -169,7 +169,7 @@ def test_crash_while_admitting_reaches_requests_off_the_queue(make_sched):
         def __getitem__(self, _):
             raise RuntimeError("KV cache layout changed")
 
-    sched.be.cache = SimpleNamespace(layers=[SimpleNamespace(keys=Broken(), values=Broken())] * 2)
+    sched.frame.kv_rows = Broken()
     a, b = _queue(sched), _queue(sched)
     sched._run()
     for h in (a, b):

@@ -13,6 +13,7 @@ This document covers the server `apps/openai_speech.py` (an OpenAI-compatible `P
 - [GPU: how streaming works](#gpu-how-streaming-works)
 - [GPU: measurements on an RTX 3060](#gpu-measurements-on-an-rtx-3060)
 - [GPU: choosing `max_streams`, streams vs. users](#gpu-choosing-max_streams-streams-vs-users)
+- [GPU: batch / offline (`infer`, `infer_batch`)](#gpu-batch--offline-infer-infer_batch)
 - [GPU: estimates for other machines](#gpu-estimates-for-other-machines)
 - [CPU: how streaming works, measurements](#cpu-how-streaming-works-measurements)
 - [Measure it on your machine](#measure-it-on-your-machine)
@@ -64,6 +65,10 @@ Environment:
 | `VIENEU_QUEUE_TIMEOUT` | 10 | Max seconds in the queue; then `429` |
 | `VIENEU_API_KEY` | (empty) | If set, requires `Authorization: Bearer <key>`. Unset on a non-loopback `HOST` → a warning at start-up |
 | `VIENEU_WATERMARK` | 1 | Perth audio watermark, per chunk |
+| `VIENEU_CODEC_GRAPH` | 1 | GPU: decode the codec with `StreamCodec` (ring KV cache + CUDA graph, see below). `0` = the codec's own streaming `batch_decode`, the path the numbers on this page were measured with |
+| `VIENEU_CODEC_DTYPE` | `fp32` | GPU: `bf16` / `fp16` runs the codec decoder in that precision (quantizer stays fp32). Off by default until its audio has been checked; `examples/bench_codec.py` prints correlation/SNR against fp32 |
+| `VIENEU_CODEC_OVERLAP` | 0 | GPU: `1` runs the codec on its own CUDA stream while frames keep being generated (a block's audio goes out one tick later). Measure before keeping it |
+| `VIENEU_STREAM_MAX_LEN` | 2048 | GPU: KV-cache positions per stream slot; every frame reads all of them for every slot. A request needs prompt + frame cap + 2: `1024` fits the default 256-character chunks and halves that read; a longer request is then refused |
 | `HOST` / `PORT` | `127.0.0.1` / 8000 | `HOST=0.0.0.0` to serve other machines (the Docker profiles set it) — together with `VIENEU_API_KEY` |
 
 The server runs **one worker** (`uvicorn workers=1`): the model and the scheduler live in the process; the GPU serves many streams by batching inside, not by forking. Scale out by running several containers, one GPU each.
@@ -176,7 +181,9 @@ Real costs (RTX 3060, bf16):
 | Graph frame | 7 ms (B=1) · 8 (8) · 9 (16) · 10 (32) | For the **whole** batch |
 | **Codec** (4 frames) | **~65 ms + ~2.5 ms × reserved slots** | Independent of frame count and of rows actually in use; launch-bound |
 
-The key point: **the codec is the whole cost**, and it scales with `max_streams` (slots the codec session reserves), not with the streams actually running. That is why `max_streams=32` slows down even a single stream. The codec's built-in `use_cuda_graph` mode is 3x cheaper but produces wrong audio (correlation 0.2 with the plain decode), so it is not used.
+The key point: **the codec is the whole cost**, and it scales with `max_streams` (slots the codec session reserves), not with the streams actually running. That is why `max_streams=32` slows down even a single stream. The codec's built-in `use_cuda_graph` mode is 3x cheaper but produces wrong audio (correlation 0.2 with the plain decode): its session keeps views of the graph's output buffer, so a 4-frame call returns the last frame 4 times.
+
+**Since 2026-10 (`VIENEU_CODEC_GRAPH=1`, the default)** the codec runs through `src/vieneu/v3_turbo_serve/codec_stream.py` instead: the codec's own layers, but a ring KV cache written in place (the codec's session rewrites every layer's whole attention window each frame, for every reserved slot — that is the ~2.5 ms per slot) and one CUDA graph per code frame. Audio matches the plain decode to ~1e-5 in fp32. The numbers on this page were measured **before** that change; compare on your machine with `examples/bench_codec.py` (old vs new codec call) and `VIENEU_CODEC_GRAPH=0` vs `1` with the benchmarks below.
 
 The old path (before 2026-09-15): single-sequence engine without CUDA graphs, TTFA 280–360 ms, a lock for the whole utterance → 1 stream, RTF 0.85.
 
@@ -277,6 +284,23 @@ Rule: `max_streams` = the highest number of **simultaneous** streams you need, n
 
 ---
 
+## GPU: batch / offline (`infer`, `infer_batch`)
+
+`infer` / `infer_batch` (Web UI, SRT, scripts) run the static batch engine (`src/vieneu/v3_turbo_serve/engine.py`): the chunks of a text share one CUDA graph per frame, then the codec turns each row's codes into audio.
+
+- **Concurrent calls share a run.** Calls that arrive while a batch runs wait, and the next run takes every waiting call with the same sampling settings (temperature, top-k, top-p, penalty) as one batch, up to `max_batch_size` rows (`Vieneu(max_batch_size=...)`). Different settings run one after another. If a merged run fails, its calls are re-run one by one, so one caller's bad input fails only that caller.
+- **Rows are decoded several per codec call**, grouped longest first under `VIENEU_DECODE_BUDGET_MB` (default 1024) of attention mask — a 300-frame row (24 s) takes ~370 MB, a 75-frame row ~23 MB. Lower it on small GPUs if decoding runs out of memory.
+- **Warm-up**: the first call for a new batch size captures a CUDA graph (~0.5 s). `tts.warmup()` captures sizes 1 and `max_batch_size` up front; the Web UI calls it after loading v3 Turbo on a GPU.
+- **Large GPUs**: VRAM is rarely the limit. `max_batch_size=64` (or 128 for long documents) fits a 16 GB card — a batch-32 graph with a 1024-position cache pins ~0.4 GB. Each distinct sampling setting keeps its own graphs; `VIENEU_FUSED_SAMPLINGS` (default 2) is how many settings keep theirs.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `VIENEU_MAX_BATCH_ROWS` | 32 | Rows per merged run when the engine is used without `Vieneu` (which sets it to `max_batch_size`) |
+| `VIENEU_DECODE_BUDGET_MB` | 1024 | Attention-mask budget of one batched codec decode |
+| `VIENEU_FUSED_SAMPLINGS` | 2 | Sampling settings whose CUDA graphs are kept |
+
+---
+
 ## GPU: estimates for other machines
 
 **Nothing but the RTX 3060 has been measured** — the table below is reasoning from the cost structure, meant for planning and to be verified with [Measure it on your machine](#measure-it-on-your-machine).
@@ -285,7 +309,7 @@ Three facts from the measurements drive the estimates:
 
 1. **VRAM is not the limit.** 16 streams peak at 1.1 GB, 32 at 1.8 GB. A 4 GB card fits 16 streams, 6 GB fits 32.
 2. **The limit is per-call overhead (launch-bound), not FLOPS.** The 12-layer, 768-wide backbone and the 11M-parameter codec are tiny; the time goes to hundreds of small kernel launches. A much bigger GPU (4090, A100) therefore does **not** cut TTFA much; a fast host CPU, the driver, PCIe and not sharing the GPU matter as much as the GPU itself.
-3. **GPU generation matters through dtype and CUDA graphs.** Ampere and newer (RTX 30/40, A-series) run bf16 like the test machine. Turing/Pascal (GTX 16, RTX 20, T4, GTX 10) lack bf16 → the code falls back to **fp16**; that path is **unverified for quality** (activation overflow is possible). CUDA graphs need a CUDA ≥ 11 driver, available on every card since Maxwell.
+3. **GPU generation matters through dtype and CUDA graphs.** Ampere and newer (RTX 30/40, A-series) run bf16 like the test machine. Turing/Volta/Pascal (GTX 16, RTX 20, T4, V100, GTX 10) lack native bf16 → `dtype="auto"` runs the model in **fp32** (torch's default bf16 check accepts emulated bf16 on these cards; the code asks for native support only). fp32 is the safe choice there; nothing on this page was measured with it. CUDA graphs need a CUDA ≥ 11 driver, available on every card since Maxwell.
 
 | Machine | VRAM | Est. TTFA, 1 stream | Est. real-time streams | Notes |
 |---|---|---|---|---|
@@ -293,9 +317,9 @@ Three facts from the measurements drive the estimates:
 | RTX 3050 / 4060 8 GB, RTX 3060 Ti / 4070 | 6–12 | 100–130 ms | 16, up to ~32 | Same generation and launch-bound, so about equal to the 3060; a power-limited laptop 4060 may be 10–20 % slower |
 | RTX 3050 laptop 4 GB, RTX A2000 | 4 | 120–160 ms | 8–12 (`max_streams=8`–`12`) | VRAM suffices; low clocks and sharing with the OS → keep `max_streams` small |
 | RTX 4090 / A10 / L4 | 16–24 | 90–110 ms | 24–32 | Codec part faster, launch part not; the real ceiling is the host CPU |
-| T4 16 GB (cloud) | 16 | 150–220 ms | 8–12 | Turing → fp16 (unverified); low clocks; cloud VMs often have weak CPUs → more launch overhead |
+| T4 16 GB (cloud) | 16 | 150–220 ms | 8–12 | Turing → fp32 model; low clocks; cloud VMs often have weak CPUs → more launch overhead |
 | GTX 1660 / RTX 2060 6 GB | 6 | 140–200 ms | 8–12 | As T4, with a faster desktop CPU |
-| GTX 1650 4 GB, GTX 1050 Ti | 4 | 180–250 ms | 4–8 | fp16 (Pascal has no tensor cores: fp32 codec ~1.5–2× slower) |
+| GTX 1650 4 GB, GTX 1050 Ti | 4 | 180–250 ms | 4–8 | fp32 model (no native bf16; Pascal has no tensor cores) |
 | GPU < 4 GB | <4 | — | 2–4, or use the CPU | Needs `max_streams` ≤ 4 for the static cache + codec; no clear win over CPU int8 |
 
 How to read it: TTFA ≈ prefill (20–40 ms) + 2 graph frames (15–25 ms) + one codec call (60–120 ms depending on card/host). Streams ≈ (80 ms − graph frame) / (codec cost ÷ 4 frames), keeping RTF ≤ 0.6–0.7 for margin.
@@ -352,7 +376,17 @@ Reading the output:
 - The server logs every request: `ttfa=… total=… audio=… rtf=… active=…`.
 - GPU: watch `nvidia-smi` during the bench; `torch.cuda.max_memory_allocated()` in-process is more precise.
 
-For component-level numbers (prefill / frame / codec) see the docstring of `src/vieneu/v3_turbo_serve/stream.py` and the tests in `tests/fused/cases.py`.
+For component-level numbers (prefill / frame / codec) see the docstring of `src/vieneu/v3_turbo_serve/stream.py` and the tests in `tests/fused/cases.py`. The codec call alone, old path vs `StreamCodec`, per `max_streams` and dtype (loads only the 88 MB codec):
+
+```bash
+uv run python examples/bench_codec.py --max-streams 8 16 32 64 --dtype fp32 bf16 --json codec.json
+```
+
+Frame time per batch size, prefill (HF vs the static prefill the scheduler now uses) and in-process streams — run once per setting (`VIENEU_CODEC_GRAPH=0`, `VIENEU_CODEC_OVERLAP=1`, …) to compare:
+
+```bash
+uv run python examples/bench_stream.py --json stream.json
+```
 
 ---
 
@@ -366,7 +400,7 @@ For component-level numbers (prefill / frame / codec) see the docstring of `src/
 | Choppy audio at the client | No pre-buffer, or RTF > 1 (CPU fp32 with several requests) | Pre-buffer 150–300 ms (GPU) / ≥ 300 ms (CPU); on CPU use int8 and keep 1–2 streams |
 | First request after start-up takes 1–2 s | Warm-up not finished | The server warms itself; wait for `/health` to return `ok` before sending traffic |
 | Disable the CUDA-graph path (debugging) | — | `VIENEU_FUSED_FRAME=0` → `infer_stream` falls back to the single engine (1 stream, ~300 ms) |
-| Turing/Pascal GPU, odd audio | fp16 fallback is unverified | Try `Vieneu(dtype="float32")` (~1.5× slower) or open an issue with a sample |
+| Turing/Volta/Pascal GPU, slow or odd audio | Before 2026-10, `dtype="auto"` picked emulated bf16 on these cards | Update, or pass `Vieneu(dtype="float32")`; open an issue with a sample if it persists |
 | Need mp3/opus | Not supported | Put a reverse proxy/ffmpeg in front, or take `pcm` and encode client-side; adds ~20–40 ms |
 | `repetition_window` other than the default has no effect (GPU) | The penalty window is the scheduler's fixed ring size | Tune `repetition_penalty` instead; the default window is shared |
 | Does a dropped connection keep a slot? | No | Closing the response closes the generator → the GPU slot frees at the next tick (verified) |
