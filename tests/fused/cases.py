@@ -282,3 +282,376 @@ def test_onnx_reference_encoder_has_no_pad_frame():
         codes = tts.engine._encode_ref_wav(np.zeros(n * F + extra, np.float32), 48_000)
         assert codes.shape[0] == n + (1 if extra else 0)
         assert int(codes[-1, 0]) != ENCODER_PAD_CODE and int(codes[-1, 0]) == 482
+
+
+# ── streaming codec: ring KV cache + CUDA graph (codec_stream.py) ────────────
+
+_MOSS_REPO = "OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano"
+
+
+def _moss_codec(device: str):
+    """Codec thật; trên CPU chỉ dùng bản đã có trong cache HF (không tải 88 MB
+    trong CI) trừ khi đặt VIENEU_TEST_CODEC=1."""
+    import os
+    from transformers import AutoModel
+    local_only = device == "cpu" and os.environ.get("VIENEU_TEST_CODEC") != "1"
+    try:
+        tok = AutoModel.from_pretrained(_MOSS_REPO, trust_remote_code=True, local_files_only=local_only)
+    except Exception as e:   # noqa: BLE001 — chưa có trong cache / không có mạng
+        pytest.skip(f"MOSS codec unavailable: {e}")
+    return tok.to(device).eval()
+
+
+def _full_decode(tok, codes_tn: torch.Tensor) -> torch.Tensor:
+    """Decode thường (không streaming) của mã ``(T, n_vq)`` → mono ``(T*3840,)``."""
+    with torch.no_grad():
+        out = tok.decode(codes_tn.T.unsqueeze(1).to(next(tok.parameters()).device), return_dict=True)
+    return out.audio[0].float().mean(0).cpu()
+
+
+def test_plan_codec_block_windows():
+    from vieneu.v3_turbo_serve.stream import plan_codec_block
+    # Ranh giới K=4 (base=8, tick=12): hai row đầy đủ, một row mới vào ở frame 10.
+    first, active = plan_codec_block([(0, 8, 12), (1, 8, 12), (2, 10, 12)], base=8)
+    assert first == 0 and active == [{0, 1}, {0, 1}, {0, 1, 2}, {0, 1, 2}]
+    # Lead-in giữa block: row cũ đã decode tới 10, row mới (slot 3) từ 9.
+    first, active = plan_codec_block([(0, 10, 11), (3, 9, 11)], base=7)
+    assert first == 2 and active == [{3}, {0, 3}]
+    # Row kết thúc đúng ranh giới: không còn gì để decode.
+    assert plan_codec_block([(0, 12, 12)], base=8) == (0, [])
+    # Row kết thúc giữa block: chỉ decode tới frame cuối của nó.
+    first, active = plan_codec_block([(5, 8, 10)], base=8)
+    assert first == 0 and active == [{5}, {5}]
+    with pytest.raises(ValueError):
+        plan_codec_block([(0, 3, 6)], base=4)
+
+
+def _run_slots(codec, codes, rows):
+    """Đẩy ``codes`` (N, B, n_vq) qua codec từng frame; ``rows`` = (slot, start,
+    len). Slot của row xong được reset trước khi row sau dùng lại."""
+    N, B, _ = codes.shape
+    active = torch.zeros(N, B, dtype=torch.bool)
+    for s, a, n in rows:
+        active[a:a + n, s] = True
+    dev = codec.device
+    out = []
+    for f in range(N):
+        codec.reset_slots([s for s, a, n in rows if a + n == f])
+        out.append(codec.decode_block(codes[f:f + 1].to(dev), active[f:f + 1].to(dev))[0])
+    return torch.stack(out)   # (N, B, 3840)
+
+
+# 170 frame: cửa sổ mọi tầng đều quay vòng (tầng đầu: 500 vị trí / 4 mỗi frame = 125 frame).
+_ROWS = [(0, 0, 170), (1, 5, 40), (2, 30, 120), (1, 60, 100)]
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_stream_codec_matches_full_decode(device):
+    """Nhiều slot vào/ra ở các thời điểm khác nhau, slot rảnh, slot được dùng
+    lại, cửa sổ attention quay vòng: audio từng row == decode đầy đủ mã của nó."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    from vieneu.v3_turbo_serve.codec_stream import StreamCodec
+    tok = _moss_codec(device)
+    torch.manual_seed(1)
+    codes = torch.randint(0, 1024, (170, 3, 16))
+    out = _run_slots(StreamCodec(tok, 3), codes, _ROWS)   # CUDA: qua CUDA graph
+    for s, a, n in _ROWS:
+        full = _full_decode(tok, codes[a:a + n, s])
+        got = out[a:a + n, s].reshape(-1)
+        assert got.shape == full.shape
+        assert (got - full).abs().max().item() < 1e-3, (s, a, n)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_stream_codec_graph_matches_eager():
+    from vieneu.v3_turbo_serve.codec_stream import StreamCodec
+    tok = _moss_codec("cuda")
+    torch.manual_seed(2)
+    codes = torch.randint(0, 1024, (40, 4, 16))
+    rows = [(0, 0, 40), (1, 3, 20), (3, 10, 30), (1, 25, 15)]
+    graphed = StreamCodec(tok, 4, use_graph=True)
+    eager = StreamCodec(tok, 4, use_graph=False)
+    assert graphed.graph is not None and eager.graph is None
+    a, b = _run_slots(graphed, codes, rows), _run_slots(eager, codes, rows)
+    for s, st, n in rows:
+        assert (a[st:st + n, s] - b[st:st + n, s]).abs().max().item() < 1e-4
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_stream_codec_bf16_stays_close_to_fp32():
+    """bf16 (VIENEU_CODEC_DTYPE=bf16) trên mã giọng thật: chỉ chặn hỏng nặng —
+    chất lượng nghe được phải kiểm bằng tai / examples/bench_codec.py."""
+    import json
+    from pathlib import Path
+    from vieneu.v3_turbo_serve.codec_stream import StreamCodec
+    tok = _moss_codec("cuda")
+    path = Path(__file__).resolve().parents[2] / "src" / "vieneu" / "assets" / "voices_v3_turbo.json"
+    v = next(iter(json.loads(path.read_text(encoding="utf-8"))["presets"].values()))
+    codes = torch.tensor(v["codes"], dtype=torch.long)        # (T, 16), giọng thật
+    rows = [(0, 0, codes.shape[0])]
+    c = codes.unsqueeze(1)
+    ref = _run_slots(StreamCodec(tok, 1), c, rows)[:, 0].reshape(-1)
+    bf = _run_slots(StreamCodec(tok, 1, compute_dtype=torch.bfloat16), c, rows)[:, 0].reshape(-1)
+    corr = torch.corrcoef(torch.stack([ref, bf]))[0, 1].item()
+    assert corr > 0.95, corr
+
+
+class _FakeStreamFrame:
+    """Thay ``StreamFrame`` (cần CUDA) cho test sổ sách của scheduler: mỗi
+    ``replay()`` ghi frame kế tiếp của từng row vào ring mã như graph thật."""
+
+    def __init__(self, B: int, n_vq: int = 16, ring: int = 512):
+        self.B, self.n_vq, self.ring = B, n_vq, ring
+        self.codes = torch.zeros(ring, B, n_vq, dtype=torch.long)
+        self.frame = 0
+        self.rows = {}      # slot -> (f0, codes (n, n_vq))
+        self.finished = [True] * B
+        self.length = [0] * B
+
+    def admit(self, b, codes):
+        self.rows[b] = (self.frame, codes)
+        self.finished[b] = False
+        return self.frame
+
+    def replay(self):
+        f = self.frame
+        for b, (f0, c) in self.rows.items():
+            if not self.finished[b]:
+                self.codes[f % self.ring, b] = c[f - f0]
+                if f + 1 - f0 >= c.shape[0]:
+                    self.finished[b], self.length[b] = True, f + 1
+        self.frame += 1
+
+    def status(self):
+        return [int(x) for x in self.finished] + list(self.length)
+
+    def recent_codes(self, k, host=True):
+        idx = torch.remainder(torch.arange(self.frame - k, self.frame), self.ring)
+        return self.codes.index_select(0, idx)
+
+
+@pytest.mark.parametrize("use_stream_codec, overlap", [(True, False), (True, True), (False, False)])
+def test_scheduler_decode_bookkeeping_matches_full_decode(use_stream_codec, overlap):
+    """``_step``/``_decode`` thật của scheduler (lead-in, kết thúc giữa block,
+    slot dùng lại) với graph giả: audio mỗi luồng == decode đầy đủ mã của nó,
+    qua StreamCodec (cả chế độ overlap: audio giao trễ một tick) lẫn session
+    streaming của chính codec."""
+    from vieneu.v3_turbo_serve.codec_stream import StreamCodec
+    from vieneu.v3_turbo_serve.stream import StreamHandle, V3TurboStreamScheduler
+    tok = _moss_codec("cpu")
+    B = 3
+    sched = object.__new__(V3TurboStreamScheduler)   # no __init__: no CUDA graph, no worker thread
+    sched.B, sched.K, sched.leadin, sched.tick = B, 4, 2, 0
+    sched.tok = tok
+    sched.frame = _FakeStreamFrame(B)
+    sched._slots, sched._codec_rows, sched._codec_fresh = [None] * B, [], True
+    sched.codec = StreamCodec(tok, B) if use_stream_codec else None
+    sched.overlap, sched._inflight = overlap, None
+    torch.manual_seed(3)
+    # (tick at which it arrives, frames) — row 3 reuses a freed slot; lengths not multiples of K.
+    plan = [(0, 13), (1, 22), (6, 7), (15, 18)]
+    codes = [torch.randint(0, 1024, (n, 16)) for _, n in plan]
+    handles = [None] * len(plan)
+    for _ in range(200):
+        for i, (t, _n) in enumerate(plan):
+            if handles[i] is None and t <= sched.tick and None in sched._slots:   # else it waits, as in the queue
+                b = sched._slots.index(None)
+                h = StreamHandle(sched, {})
+                h.slot, h.f0 = b, sched.frame.admit(b, codes[i])
+                h.decoded_upto = h.f0
+                sched._slots[b] = h
+                sched._codec_rows.append(h)
+                handles[i] = h
+        if all(h is not None for h in handles) and not sched._codec_rows:
+            break
+        sched._step()
+    sched._flush(wait=True)      # what the worker does before going idle
+    assert not sched._codec_rows and sched._slots == [None] * B and sched._inflight is None
+    for i, h in enumerate(handles):
+        chunks = []
+        while True:
+            item = h.q.get_nowait()
+            if item is None:
+                break
+            chunks.append(item)
+        got = torch.from_numpy(__import__("numpy").concatenate(chunks))
+        full = _full_decode(tok, codes[i])
+        assert got.shape == full.shape, (i, got.shape, full.shape)
+        assert (got - full).abs().max().item() < 1e-3, i
+
+
+# ── issue #4: dtype="auto" must not pick emulated bf16 ───────────────────────
+
+@pytest.mark.parametrize("native, want", [(True, torch.bfloat16), (False, torch.float32)])
+def test_auto_dtype_needs_native_bf16(monkeypatch, native, want):
+    """Turing/Volta: torch.cuda.is_bf16_supported() mặc định trả True nhờ giả lập;
+    dtype="auto" chỉ được chọn bf16 khi card có bf16 thật (Ampere+)."""
+    from types import SimpleNamespace
+    from vieneu._v3_turbo_engine.inference_v3_turbo import VieNeuTTSv3Turbo
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported",
+                        lambda including_emulation=True: native or including_emulation)
+    fake = SimpleNamespace(device=torch.device("cuda"))
+    assert VieNeuTTSv3Turbo._resolve_dtype(fake, "auto") == want
+    assert VieNeuTTSv3Turbo._resolve_dtype(SimpleNamespace(device=torch.device("cpu")), "auto") == torch.float32
+
+
+# ── issue #3: batch path — batched codec decode, coalesced concurrent calls ──
+
+def test_decode_rows_matches_one_decode_per_row():
+    """Nhiều row độ dài khác nhau (cả row rỗng), ngân sách nhỏ để buộc chia
+    nhóm: kết quả == decode từng row riêng như trước."""
+    from vieneu.v3_turbo_serve.engine import decode_rows
+    tok = _moss_codec("cpu")
+    torch.manual_seed(4)
+    lens = [37, 0, 12, 60, 59, 5]
+    codes = [torch.randint(0, 1024, (n, 16)) for n in lens]
+    got = decode_rows(tok, codes, budget_mb=60)   # 60-frame row ≈ 14 MB → nhóm ≤ 4 row
+    for c, g in zip(codes, got):
+        if len(c) == 0:
+            assert g.shape == (0,)
+            continue
+        want = _full_decode(tok, c).numpy()
+        assert g.shape == want.shape
+        assert abs(g - want).max() < 1e-4
+
+
+def _coalescer_threads(co, calls, fn):
+    """Start one thread per call, each only once the previous one is queued,
+    so the queue order is the order of ``calls``."""
+    import threading
+    import time
+    out = [None] * len(calls)
+
+    def one(i, key, items):
+        try:
+            out[i] = co.run(key, items, fn)
+        except Exception as e:   # noqa: BLE001
+            out[i] = e
+    ths = []
+    for i, (k, it) in enumerate(calls):
+        n = len(co._queue)
+        t = threading.Thread(target=one, args=(i, k, it))
+        t.start()
+        ths.append(t)
+        while len(co._queue) == n:
+            time.sleep(0.005)
+    return ths, out
+
+
+def test_coalescer_merges_waiting_calls_with_the_same_key():
+    import threading
+    import time
+    from vieneu.v3_turbo_serve.engine import _Coalescer
+    co = _Coalescer(max_items=5)
+    runs = []
+    release = threading.Event()
+
+    def fn(items):
+        runs.append(list(items))
+        if len(runs) == 1:
+            release.wait(5)          # run đầu giữ máy bận để các call sau xếp hàng
+        return [x * 10 for x in items]
+
+    first = threading.Thread(target=lambda: co.run("a", [1], fn))
+    first.start()
+    while not runs:
+        time.sleep(0.01)
+    calls = [("a", [2, 3]), ("b", [4]), ("a", [5]), ("a", [6, 7, 8])]
+    ths, out = _coalescer_threads(co, calls, fn)   # tất cả đã vào hàng đợi, đúng thứ tự
+    release.set()
+    first.join(5)
+    for t in ths:
+        t.join(5)
+    assert out == [[20, 30], [40], [50], [60, 70, 80]]
+    # Sau run đầu: [2,3]+[5] chung một run ("b" khác key, [6,7,8] vượt trần 5),
+    # rồi "b", rồi [6,7,8].
+    assert runs[1:] == [[2, 3, 5], [4], [6, 7, 8]] and co.runs == 4
+
+
+def test_coalescer_isolates_a_failing_call():
+    import threading
+    import time
+    from vieneu.v3_turbo_serve.engine import _Coalescer
+    co = _Coalescer(max_items=8)
+    release = threading.Event()
+    seen = []
+
+    def fn(items):
+        seen.append(list(items))
+        if len(seen) == 1:
+            release.wait(5)
+        if "bad" in items:
+            raise ValueError("bad input")
+        return [x.upper() for x in items]
+
+    first = threading.Thread(target=lambda: co.run("k", ["x"], fn))
+    first.start()
+    while not seen:
+        time.sleep(0.01)
+    ths, out = _coalescer_threads(co, [("k", ["a", "b"]), ("k", ["bad"]), ("k", ["c"])], fn)
+    release.set()
+    first.join(5)
+    for t in ths:
+        t.join(5)
+    assert out[0] == ["A", "B"] and out[2] == ["C"]
+    assert isinstance(out[1], ValueError)
+
+
+# ── issue #2: AR frame — static acoustic step, own prefill into the ring ─────
+
+def _tts_fp32(device: str):
+    """Model v3 Turbo fp32; trên CPU chỉ chạy khi model đã có trong cache HF."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    if device == "cpu":
+        from huggingface_hub import try_to_load_from_cache
+        if not isinstance(try_to_load_from_cache("pnnbao-ump/VieNeu-TTS-v3-Turbo", "update/model.safetensors"), str):
+            pytest.skip("v3 Turbo weights not in the local HF cache")
+    from vieneu import Vieneu
+    return Vieneu(mode="v3turbo", device=device, backend="pytorch", dtype="float32")
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_acoustic_static_steps_match_cached_step(device):
+    """``acoustic_frame_gpu`` (buffer K/V cố định, bias dựng sẵn) == đường
+    ``cached_step`` cũ: greedy cho đúng cùng mã và cùng cờ EOS."""
+    from vieneu.v3_turbo_serve.batched_acoustic import generate_frame_batched
+    from vieneu.v3_turbo_serve.fused import acoustic_frame_gpu
+    m = _tts_fp32(device).engine.model
+    torch.manual_seed(0)
+    for B in (1, 3):
+        h = torch.randn(B, m.config.hidden_size, device=device) * 0.5
+        want, pre = generate_frame_batched(m, h, temperature=0.0, top_k=25, top_p=0.95)
+        want_eos = m.text_lm_head(pre[:, 0]).float().argmax(-1) == m.config.speech_generation_end_token_id
+        got, eos = acoustic_frame_gpu(m, h, temperature=0.0, top_k=25, top_p=0.95,
+                                      repetition_penalty=1.0, rep=None)
+        assert torch.equal(want, got) and torch.equal(want_eos, eos)
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_static_prefill_matches_hf_prefill(device):
+    """``StaticBackbone.prefill`` (không DynamicCache) == prefill HF: hidden cuối
+    và K/V từng row (độ dài khác nhau, có row không mã tham chiếu)."""
+    from vieneu.v3_turbo_serve.fused import StaticBackbone
+    tts = _tts_fp32(device)
+    eng = tts._get_batch_engine()
+    voice = tts.get_preset_voice()
+    reqs = [{"text": t, "speaker_emb": voice["speaker_emb"], "ref_codes": voice["codes"]}
+            for t in ["Xin chào các bạn.", "Hôm nay trời đẹp quá, mình đi dạo nhé.", "Ba."]]
+    reqs.append({"text": "Không có mã tham chiếu.", "speaker_emb": voice["speaker_emb"],
+                 "ref_codes": voice["codes"], "use_ref_codes": False})
+    embeds = [eng._prompt_embeds(r) for r in reqs]
+    h_ref, cache, mask, _ = eng.bb.prefill(embeds)
+    sb = StaticBackbone(eng.model, len(embeds), 1024)
+    h_new, keys, values = sb.prefill(embeds)
+    assert torch.allclose(h_ref, h_new, atol=1e-4, rtol=1e-4)
+    T = mask.shape[1]
+    for r, e in enumerate(embeds):
+        Ti = e.shape[0]
+        for l in range(len(sb.layers)):
+            layer = cache.layers[l] if hasattr(cache, "layers") else None
+            k = (layer.keys if layer is not None else cache.key_cache[l])[r, :, T - Ti:]
+            v = (layer.values if layer is not None else cache.value_cache[l])[r, :, T - Ti:]
+            assert keys[r][l].shape == k.shape
+            assert torch.allclose(k, keys[r][l], atol=1e-4) and torch.allclose(v, values[r][l], atol=1e-4)

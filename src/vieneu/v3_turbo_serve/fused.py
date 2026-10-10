@@ -182,7 +182,6 @@ def acoustic_frame_gpu(
     cfg = model.config
     n_vq, H = cfg.n_vq, cfg.hidden_size
     dec = model.acoustic_decoder
-    L = len(dec.layers)
     dt = next(dec.parameters()).dtype
     dev = backbone_hidden.device
     B = backbone_hidden.shape[0]
@@ -202,20 +201,56 @@ def acoustic_frame_gpu(
     cond = backbone_hidden.to(dt)
     sgs_ids = torch.full((B,), cfg.speech_generation_start_token_id, device=dev, dtype=torch.long)
     txt = model.text_embeddings(sgs_ids).to(dt)
-    tok = torch.stack([cond, txt], dim=1)                                          # (B, 2, H)
-    pos = torch.arange(2, device=dev, dtype=torch.long)
-    hidden, pk, pv = dec.cached_step(tok, pos, [None] * L, [None] * L)
+    step = _AcousticSteps(dec, B, n_vq + 1, dt, dev)
+    hidden = step(torch.stack([cond, txt], dim=1), 0)                             # (B, 2, H)
     is_eos = model.text_lm_head(hidden[:, 0]).float().argmax(-1) == cfg.speech_generation_end_token_id
 
     codes: List[torch.Tensor] = [_sample_ch(0, hidden[:, 1])]
     for ch in range(1, n_vq):
         emb = model.audio_embeddings[ch - 1](codes[-1]).to(dt)                     # (B, H)
-        pos = torch.arange(ch + 1, ch + 2, device=dev, dtype=torch.long)
-        hidden, pk, pv = dec.cached_step(emb.view(B, 1, H), pos, pk, pv)
+        hidden = step(emb.view(B, 1, H), ch + 1)
         codes.append(_sample_ch(ch, hidden[:, 0]))
     if use_rep:
         rep.advance()
     return torch.stack(codes, dim=1), is_eos
+
+
+class _AcousticSteps:
+    """``AcousticDecoder.cached_step`` for one frame, with the K/V of all
+    ``S = n_vq + 1`` slots in preallocated buffers and the causal bias built
+    once: no ``torch.cat`` and no mask construction per step. Same arithmetic
+    (and the same ``finfo.min`` bias) as ``cached_step``."""
+
+    def __init__(self, dec, B: int, S: int, dt, dev):
+        self.dec = dec
+        a0 = dec.layers[0].attn
+        self.nh, self.hd = a0.num_heads, a0.head_dim
+        self.k = [torch.empty(B, self.nh, S, self.hd, device=dev, dtype=dt) for _ in dec.layers]
+        self.v = [torch.empty_like(k) for k in self.k]
+        idx = torch.arange(S, device=dev)
+        self.bias = torch.zeros(S, S, device=dev, dtype=dt).masked_fill(
+            idx.view(1, -1) > idx.view(-1, 1), torch.finfo(dt).min)
+        self.pos_emb = dec.slot_pos_emb.weight.to(dt)                             # (S, H)
+
+    def __call__(self, x: torch.Tensor, p0: int) -> torch.Tensor:
+        """``x`` (B, n, H) for slots ``p0 .. p0+n-1`` → normed hidden (B, n, H)."""
+        B, n, H = x.shape
+        p1 = p0 + n
+        x = x + self.pos_emb[p0:p1].unsqueeze(0)
+        bias = self.bias[p0:p1, :p1]
+        for i, layer in enumerate(self.dec.layers):
+            a = layer.attn
+            h = layer.norm1(x)
+            q, k, v = a.qkv(h).reshape(B, n, 3, self.nh, self.hd).unbind(dim=2)
+            q = a.q_norm(q.transpose(1, 2))
+            k = a.k_norm(k.transpose(1, 2))
+            self.k[i][:, :, p0:p1] = k
+            self.v[i][:, :, p0:p1] = v.transpose(1, 2)
+            att = F.scaled_dot_product_attention(q, self.k[i][:, :, :p1], self.v[i][:, :, :p1], attn_mask=bias)
+            x = x + a.o_proj(att.transpose(1, 2).reshape(B, n, H))
+            n2 = layer.norm2(x)
+            x = x + layer.ff_down(F.silu(layer.ff_gate(n2)) * layer.ff_up(n2))
+        return self.dec.norm(x)
 
 
 # ── backbone decode over a static cache ──────────────────────────────────────
@@ -298,6 +333,54 @@ class StaticBackbone:
         self.bias[b].fill_(float("-inf"))
         self.bias[b, 0, 0].index_fill_(0, idx, 0.0)
         self.pos[b] = T
+
+    @torch.no_grad()
+    def prefill(self, embeds_list: List[torch.Tensor]):
+        """Prefill prompts (each ``(T_i, H)``) with the same HF modules as
+        ``step``, without HF's ``DynamicCache`` / mask building.
+
+        Returns ``(last_hidden (n, H), keys, values)``: ``keys[r][l]`` is prompt
+        ``r``'s layer-``l`` ``(n_kv, T_r, hd)``, exactly what ``load_row`` takes.
+        Prompts are left-padded like ``BatchedBackbone.prefill`` (positions
+        ``0..T_r-1`` over the real tokens). Does not touch the cache.
+        """
+        n = len(embeds_list)
+        dev, dt = self.k.device, self.k.dtype
+        lens = [int(e.shape[0]) for e in embeds_list]
+        T = max(lens)
+        H = embeds_list[0].shape[-1]
+        x = torch.zeros(n, T, H, device=dev, dtype=dt)
+        valid = torch.zeros(n, T, device=dev, dtype=torch.bool)
+        for i, e in enumerate(embeds_list):
+            x[i, T - lens[i]:] = e.to(dt)
+            valid[i, T - lens[i]:] = True
+        pos = (valid.long().cumsum(-1) - 1).clamp(min=0)
+        idx = torch.arange(T, device=dev)
+        allowed = (idx.view(1, -1) <= idx.view(-1, 1)).unsqueeze(0) & valid.unsqueeze(1)   # (n, Tq, Tk)
+        # Padding queries see nothing real; let them see themselves (no NaN rows).
+        allowed |= torch.eye(T, device=dev, dtype=torch.bool).unsqueeze(0)
+        bias = torch.zeros(n, 1, T, T, device=dev, dtype=dt).masked_fill(~allowed.unsqueeze(1), float("-inf"))
+        cos, sin = self.rotary(x, pos)
+        g = self.n_heads // self.n_kv
+        keys, values = [], []
+        for layer in self.layers:
+            a = layer.self_attn
+            h = layer.input_layernorm(x)
+            q = a.q_norm(a.q_proj(h).view(n, T, self.n_heads, self.hd)).transpose(1, 2)
+            k = a.k_norm(a.k_proj(h).view(n, T, self.n_kv, self.hd)).transpose(1, 2)
+            v = a.v_proj(h).view(n, T, self.n_kv, self.hd).transpose(1, 2)
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+            keys.append(k)
+            values.append(v)
+            attn = F.scaled_dot_product_attention(
+                q, k.repeat_interleave(g, dim=1), v.repeat_interleave(g, dim=1),
+                attn_mask=bias, scale=a.scaling,
+            )
+            x = x + a.o_proj(attn.transpose(1, 2).reshape(n, T, -1))
+            x = x + layer.mlp(layer.post_attention_layernorm(x))
+        last = self.norm(x)[:, -1]
+        per_row = lambda kv, r: [t[r, :, T - lens[r]:] for t in kv]
+        return last, [per_row(keys, r) for r in range(n)], [per_row(values, r) for r in range(n)]
 
     @torch.no_grad()
     def step(self, x: torch.Tensor) -> torch.Tensor:

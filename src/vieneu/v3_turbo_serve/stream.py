@@ -36,8 +36,19 @@ for any batch, a codec call is ~65 ms + ~2.5 ms per *reserved* slot
 whatever the frame count, which is why ``max_streams`` should match the
 load (32 slots: one stream already costs RTF 0.70, 32 at once reach RTF
 0.93 with 450 ms first audio). The codec's own ``use_cuda_graph`` mode
-was 3x cheaper but produced wrong audio (corr 0.2 with the plain decode),
-so it is not used.
+was 3x cheaper but produced wrong audio (corr 0.2 with the plain decode):
+its session keeps views of the graph's output buffer, so a 4-frame call
+returned the last frame 4 times.
+
+Those numbers are for the codec's own streaming decode. The codec now runs
+through ``codec_stream.StreamCodec`` instead: a ring KV cache (no per-slot
+copy of the whole attention window) and one CUDA graph per code frame.
+``VIENEU_CODEC_GRAPH=0`` goes back to the codec's own decode;
+``VIENEU_CODEC_DTYPE=bf16`` runs the codec decoder in bf16 (off by default
+until its audio has been checked). ``VIENEU_CODEC_OVERLAP=1`` runs the codec
+on its own CUDA stream while frames keep being generated: a block's audio is
+handed out on a later tick (or before going idle) instead of the worker
+waiting for it.
 
 Caveats
 -------
@@ -51,6 +62,7 @@ Caveats
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import threading
 from typing import Any, Dict, List, Optional
@@ -60,11 +72,48 @@ import torch
 
 from vieneu_utils.core_utils import check_sampling
 from .._v3_turbo_engine.rep_history import DEFAULT_REP_WINDOW
+from .codec_stream import StreamCodec, UnsupportedCodec
 from .fused import GpuRepHistory, StaticBackbone, acoustic_frame_gpu, sample_gpu_rows
 
 logger = logging.getLogger(__name__)
 
 SAMPLES_PER_FRAME = 3840   # 48 kHz / 12.5 frames per second
+
+_CODEC_DTYPES = {"fp32": None, "float32": None, "bf16": torch.bfloat16, "bfloat16": torch.bfloat16,
+                 "fp16": torch.float16, "float16": torch.float16}
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
+def _codec_dtype() -> Optional[torch.dtype]:
+    name = os.environ.get("VIENEU_CODEC_DTYPE", "fp32").strip().lower()
+    if name not in _CODEC_DTYPES:
+        logger.warning("VIENEU_CODEC_DTYPE=%s unknown (fp32 | bf16 | fp16); using fp32", name)
+    return _CODEC_DTYPES.get(name)
+
+
+def plan_codec_block(spans, base: int):
+    """Which frames of the codes window to push through the codec.
+
+    ``spans`` is one ``(slot, lo, hi)`` per row in the codec: global frames
+    ``[lo, hi)`` to decode now, with ``base <= lo <= hi`` (``base`` = global
+    frame at window index 0). Returns ``(first, active)``: window index of
+    the first frame anyone needs and ``active[f]`` = the slots that have
+    window frame ``first + f``. ``active`` is empty when no row has a frame.
+    """
+    todo = [(s, lo, hi) for s, lo, hi in spans if hi > lo]
+    if not todo:
+        return 0, []
+    first = min(lo for _, lo, _ in todo) - base
+    last = max(hi for _, _, hi in todo) - base
+    if first < 0:
+        raise ValueError(f"a row starts before the codes window ({first})")
+    return first, [{s for s, lo, hi in todo if lo <= base + f < hi} for f in range(first, last)]
 
 
 class StreamFrame:
@@ -193,11 +242,13 @@ class StreamFrame:
         """``[finished(B) as 0/1..., length(B)...]`` in one host read."""
         return torch.cat([self.finished.long(), self.length]).tolist()
 
-    def recent_codes(self, k: int) -> torch.Tensor:
-        """The last ``k`` global frames of every slot, ``(k, B, n_vq)`` on the host."""
+    def recent_codes(self, k: int, host: bool = True) -> torch.Tensor:
+        """The last ``k`` global frames of every slot, ``(k, B, n_vq)`` — on the
+        host, or on the device with ``host=False``."""
         f = int(self.frame)
         idx = torch.remainder(torch.arange(f - k, f, device=self.codes.device), self.ring)
-        return self.codes.index_select(0, idx).cpu()
+        blk = self.codes.index_select(0, idx)
+        return blk.cpu() if host else blk
 
 
 class StreamHandle:
@@ -265,8 +316,26 @@ class V3TurboStreamScheduler:
         # clocks (``nvidia-smi -lgc``) or set "prefer maximum performance".
         self.max_admit = max(1, int(max_admit_per_tick))
         self.repetition_window = int(repetition_window)
-        self.frame = StreamFrame(self.model, self.B, int(self.cfg.max_position_embeddings),
+        # KV ring length: every frame's attention reads all of it for every slot.
+        # A request needs prompt + frame cap + 2; VIENEU_STREAM_MAX_LEN=1024 halves
+        # that read and fits the default 256-char chunks (longer ones are refused).
+        max_pos = int(self.cfg.max_position_embeddings)
+        self.max_len = min(max_pos, max(256, _env_int("VIENEU_STREAM_MAX_LEN", max_pos)))
+        self.frame = StreamFrame(self.model, self.B, self.max_len,
                                  repetition_window=self.repetition_window)
+        # One codec slot per scheduler slot (codec_stream.py). None: the codec's
+        # own streaming batch_decode, which keeps rows in ``_codec_rows`` order.
+        self.codec: Optional[StreamCodec] = None
+        self.overlap = os.environ.get("VIENEU_CODEC_OVERLAP", "0") == "1"
+        # Codec block in flight (overlap): (CodecBlock or None, deliveries).
+        self._inflight: Optional[tuple] = None
+        if os.environ.get("VIENEU_CODEC_GRAPH", "1") != "0":
+            try:
+                self.codec = StreamCodec(self.tok, self.B, compute_dtype=_codec_dtype(), overlap=self.overlap)
+            except UnsupportedCodec as e:
+                logger.warning("stream: codec layout not supported (%s); using its own streaming decode", e)
+            except Exception as e:   # noqa: BLE001 — the codec is remote code, not pinned to a revision
+                logger.warning("stream: StreamCodec failed to build (%r); using the codec's own streaming decode", e)
         self.tick = 0
         self._slots: List[Optional[StreamHandle]] = [None] * self.B
         self._codec_rows: List[StreamHandle] = []   # order the codec session knows
@@ -325,6 +394,8 @@ class V3TurboStreamScheduler:
     def _run(self) -> None:
         try:
             while True:
+                if self.n_active == 0:
+                    self._flush(wait=True)   # nothing will step: hand out the last block now
                 with self._cv:
                     while self._running and self._pending.empty() and self.n_active == 0:
                         self._cv.wait()
@@ -350,7 +421,10 @@ class V3TurboStreamScheduler:
             if crashed:
                 self._error = err
             self._running = False
-            waiting = [h for h in self._slots if h is not None] + self._drain_pending()
+            inflight = [d[0] for d in self._inflight[1]] if self._inflight else []
+            self._inflight = None
+            waiting = list(dict.fromkeys(
+                [h for h in self._slots if h is not None] + inflight + self._drain_pending()))
         for h in waiting:
             h.q.put(err)
 
@@ -406,21 +480,15 @@ class V3TurboStreamScheduler:
             if not batch:
                 return
             try:
-                last_h, cache, mask, _pos = self.be.bb.prefill(embeds)
+                # Same HF modules as the graph's step, without HF's DynamicCache
+                # and mask building (fused.StaticBackbone.prefill).
+                last_h, keys_rows, values_rows = self.frame.bb.prefill(embeds)
             except Exception as err:   # noqa: BLE001 — e.g. out of memory on long prompts
                 for h in batch:
                     reject(h, err)
                 return
-            T = mask.shape[1]
             for i, h in enumerate(batch):
-                Ti = embeds[i].shape[0]
-                keys, values = [], []
-                for l in range(len(self.frame.bb.layers)):
-                    layer = cache.layers[l] if hasattr(cache, "layers") else None
-                    k = layer.keys if layer is not None else cache.key_cache[l]
-                    v = layer.values if layer is not None else cache.value_cache[l]
-                    keys.append(k[i, :, T - Ti:T])
-                    values.append(v[i, :, T - Ti:T])
+                keys, values = keys_rows[i], values_rows[i]
                 b = free.pop(0)
                 r = h.req
                 try:
@@ -448,6 +516,7 @@ class V3TurboStreamScheduler:
             raise
 
     def _step(self) -> None:
+        self._flush(wait=False)
         self.frame.replay()
         self.tick += 1
         st = self.frame.status()
@@ -471,6 +540,60 @@ class V3TurboStreamScheduler:
     def _decode(self) -> None:
         if not self._codec_rows:
             return
+        if self.codec is None:
+            self._decode_moss()
+            return
+        base = self.tick - self.K
+        spans = [(h.slot, h.decoded_upto,
+                  self.tick if h.finished_at is None else min(h.finished_at, self.tick))
+                 for h in self._codec_rows]
+        first, active = plan_codec_block(spans, base)
+        self._flush(wait=True)   # the previous block's audio goes out first
+        block = None
+        if active:
+            blk = self.frame.recent_codes(self.K, host=False)[first:first + len(active)]
+            mask = torch.zeros(len(active), self.B, dtype=torch.bool)
+            for f, slots in enumerate(active):
+                mask[f, list(slots)] = True
+            block = self.codec.launch_block(blk, mask.to(blk.device))   # audio (F, B, 3840)
+        # Bookkeeping now (a finished row's slot is free for the next admit);
+        # the audio itself is handed out by _flush, in order, then the end mark.
+        deliveries = []
+        keep: List[StreamHandle] = []
+        freed: List[int] = []
+        for h, (slot, lo, hi) in zip(self._codec_rows, spans):
+            h.decoded_upto = hi
+            final = h.finished_at is not None and hi >= h.finished_at
+            deliveries.append((h, slot, lo - base - first, hi - base - first, final))
+            if final:
+                self._slots[slot] = None
+                freed.append(slot)
+            else:
+                keep.append(h)
+        self.codec.reset_slots(freed)
+        self._codec_rows = keep
+        self._inflight = (block, deliveries)
+        if not self.overlap:
+            self._flush(wait=True)
+
+    def _flush(self, wait: bool) -> None:
+        """Hand out the audio of the codec block in flight (if ready, or wait)."""
+        if self._inflight is None:
+            return
+        block, deliveries = self._inflight
+        if block is not None and not wait and not block.ready():
+            return
+        self._inflight = None
+        audio = block.result().numpy() if block is not None else None
+        for h, slot, a, b, final in deliveries:
+            if b > a and not h.cancelled:
+                h.q.put(audio[a:b, slot].reshape(-1).copy())
+            if final:
+                h.q.put(None)
+
+    @torch.no_grad()
+    def _decode_moss(self) -> None:
+        """The codec's own streaming ``batch_decode`` (``VIENEU_CODEC_GRAPH=0``)."""
         blk = self.frame.recent_codes(self.K)            # (K, B, n_vq), global frames [tick-K, tick)
         base = self.tick - self.K
         dev = self.frame.codes.device
@@ -513,6 +636,9 @@ class V3TurboStreamScheduler:
             self._reset_codec()
 
     def _reset_codec(self) -> None:
+        if self.codec is not None:
+            self.codec.reset()
+            return
         reset = getattr(self.tok, "_reset_batch_decode_streaming_state", None)
         if callable(reset):
             try:
