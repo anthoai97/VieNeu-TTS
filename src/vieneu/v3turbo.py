@@ -212,6 +212,7 @@ class V3TurboVieNeuTTS(BaseVieneuTTS):
         # fresh temp path per upload still hits.
         from collections import OrderedDict
         self._ref_cache: "OrderedDict[tuple, Tuple[np.ndarray, Optional[np.ndarray]]]" = OrderedDict()
+        self._ref_lock = threading.Lock()
         self.backbone_repo = backbone_repo
         self._load_v3_voices()
         self._load_repo_voices(backbone_repo)
@@ -344,9 +345,12 @@ class V3TurboVieNeuTTS(BaseVieneuTTS):
             key = (digest, bool(denoise), bool(use_ref_codes))
         except OSError:
             pass   # unreadable path: let the engine raise its own error below
-        if key is not None and key in self._ref_cache:
-            self._ref_cache.move_to_end(key)
-            return self._ref_cache[key]
+        if key is not None:
+            with self._ref_lock:
+                cached = self._ref_cache.get(key)
+                if cached is not None:
+                    self._ref_cache.move_to_end(key)
+                    return cached
         clean_ref = self._preclean_reference_audio(ref_audio)
         try:
             out = self.engine.prepare_reference(str(clean_ref), denoise=denoise, use_ref_codes=use_ref_codes)
@@ -357,9 +361,10 @@ class V3TurboVieNeuTTS(BaseVieneuTTS):
                 except Exception:
                     pass
         if key is not None:
-            self._ref_cache[key] = out
-            while len(self._ref_cache) > self.REF_CACHE_MAX:
-                self._ref_cache.popitem(last=False)
+            with self._ref_lock:
+                self._ref_cache[key] = out
+                while len(self._ref_cache) > self.REF_CACHE_MAX:
+                    self._ref_cache.popitem(last=False)
         return out
 
     def encode_reference(self, ref_audio: Union[str, Path], denoise: bool = True) -> Tuple[np.ndarray, np.ndarray]:
