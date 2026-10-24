@@ -65,6 +65,7 @@ Biến môi trường:
 | `VIENEU_QUEUE_TIMEOUT` | 10 | Giây chờ tối đa trong hàng; hết → `429` |
 | `VIENEU_API_KEY` | (trống) | Nếu đặt, yêu cầu `Authorization: Bearer <key>`. Để trống mà `HOST` không phải loopback → cảnh báo lúc khởi động |
 | `VIENEU_WATERMARK` | 1 | Đóng watermark âm thanh (Perth) từng chunk |
+| `VIENEU_FASTPATH` | 1 | GPU: bản viết lại ít kernel của đường nóng (`v3_turbo_serve/fastpath.py` + các tầng nhanh của codec, xem "GPU: cơ chế streaming"). `0` = graph fused, prefill HF và các lớp codec như mô tả bên dưới |
 | `VIENEU_CODEC_GRAPH` | 1 | GPU: decode codec bằng `StreamCodec` (KV cache dạng ring + CUDA graph, xem bên dưới). `0` = `batch_decode` streaming của chính codec — đường đã dùng để đo các số liệu trong trang này |
 | `VIENEU_CODEC_DTYPE` | `fp32` | GPU: `bf16` / `fp16` chạy decoder của codec ở độ chính xác đó (quantizer vẫn fp32). Mặc định tắt cho tới khi kiểm xong chất lượng audio; `examples/bench_codec.py` in tương quan/SNR so với fp32 |
 | `VIENEU_CODEC_OVERLAP` | 0 | GPU: `1` chạy codec trên CUDA stream riêng trong khi vẫn sinh khung (audio của một block ra trễ một tick). Đo trước khi giữ |
@@ -184,6 +185,18 @@ Chi phí thực (RTX 3060, bf16):
 Điểm quan trọng: **codec là toàn bộ chi phí**, và chi phí ấy tỷ lệ với `max_streams` (số slot phiên codec giữ), không phải số luồng thực đang chạy. Vì thế `max_streams=32` làm cả một luồng đơn lẻ cũng chậm đi. Chế độ `use_cuda_graph` sẵn có của codec nhanh gấp 3 nhưng cho audio sai (tương quan 0,2 với decode thường): session của nó giữ view vào buffer đầu ra của graph, nên một lần gọi 4 khung trả về khung cuối 4 lần.
 
 **Từ 2026-10 (`VIENEU_CODEC_GRAPH=1`, mặc định)** codec chạy qua `src/vieneu/v3_turbo_serve/codec_stream.py`: vẫn các lớp của codec, nhưng KV cache là ring ghi tại chỗ (session của codec chép lại toàn bộ cửa sổ attention của mọi lớp mỗi khung, cho mọi slot đã cấp — đó là ~2,5 ms mỗi slot) và một CUDA graph cho mỗi khung mã. Audio khớp decode thường tới ~1e-5 ở fp32. Các số liệu trong trang này đo **trước** thay đổi đó; tự so trên máy bằng `examples/bench_codec.py` (lời gọi codec cũ vs mới) và chạy các bench bên dưới với `VIENEU_CODEC_GRAPH=0` rồi `1`.
+
+**Từ 24/10/2026 (`VIENEU_FASTPATH=1`, mặc định)** cùng model đó chạy qua `src/vieneu/v3_turbo_serve/fastpath.py`. Khung ở trên bị giới hạn bởi số lần launch (~2.300 node graph, ~1,5 µs mỗi node, 5,8 ms dù 1 hay 16 row); bản viết lại giữ nguyên phép toán và cắt bớt kernel: trọng số norm gộp vào phép chiếu kế tiếp, GEMM QKV / gate-up gộp, RoPE thành một phép nhân ma trận, attention bằng `baddbmm` + `bmm` với điểm fp32, sampler top-k + "exponential race", lịch sử phạt lặp cập nhật một lần mỗi khung. Prompt (embedding → 12 lớp → KV) là một CUDA graph cho mỗi bucket 32 token (2,2 ms thay vì 21–27 ms). Codec streaming được làm tương tự (quantizer thành một bảng, rotary tính một lần mỗi tầng, 15 kernel mỗi lớp), và cả khung AR lẫn codec có một graph cho mỗi bucket slot (1, 2, 4, … `max_streams`) nên một người nghe không còn phải trả giá cho 16 slot. `infer` decode cả câu bằng `StreamCodec.decode_full` (nhanh hơn decode của codec 2–4 lần, và đúng fp32 — conv của quantizer trong codec chạy TF32). Ở fp32 đầu ra greedy giống hệt đường cũ từng khung; ở bf16 sai khác so với fp32 ngang đường cũ (`tests/fused/cases.py`).
+
+RTX 5060 Ti 16 GB, bf16, Windows, trong tiến trình, GPU không có việc khác; min / trung vị của 10 lần, `max_streams=16`:
+
+| | `infer` | TTFA `infer_stream` | tổng stream |
+|---|---|---|---|
+| 1,7 s audio | 163 / 180 → **71 / 81 ms** | 40 / 50 → **8,4 / 9,0 ms** | 247 / 279 → **92 / 105 ms** |
+| 4,1 s | 350 / 371 → **172 / 185 ms** | 48 / 51 → **9,3 / 9,9 ms** | 628 / 669 → **245 / 259 ms** |
+| 13 s | 748 / 796 → **348 / 380 ms** | 49 / 62 → **11,3 / 12,2 ms** | 1810 / 1895 → **684 / 752 ms** |
+
+(bên trái: `VIENEU_FASTPATH=0`). Mỗi khung ở B = 1: 5,8 → 2,8 ms (backbone 1,15, acoustic decoder 0,96, sampling 0,41); một khung codec khi 1/16 slot bận: 4,5 → 1,1 ms. `VIENEU_CODEC_OVERLAP=1` đo chậm hơn trên card này (hai stream graph làm chậm nhau) nên vẫn tắt.
 
 Đường cũ (trước 15/09/2026): engine đơn không CUDA graph, TTFA 280–360 ms, giữ khoá cả lượt → 1 luồng, RTF 0,85.
 

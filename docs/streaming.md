@@ -65,6 +65,7 @@ Environment:
 | `VIENEU_QUEUE_TIMEOUT` | 10 | Max seconds in the queue; then `429` |
 | `VIENEU_API_KEY` | (empty) | If set, requires `Authorization: Bearer <key>`. Unset on a non-loopback `HOST` → a warning at start-up |
 | `VIENEU_WATERMARK` | 1 | Perth audio watermark, per chunk |
+| `VIENEU_FASTPATH` | 1 | GPU: the low-launch rewrite of the hot path (`v3_turbo_serve/fastpath.py` + the codec's fast stages, see "GPU: how streaming works"). `0` = the fused graphs, HF prefill and codec layers described below |
 | `VIENEU_CODEC_GRAPH` | 1 | GPU: decode the codec with `StreamCodec` (ring KV cache + CUDA graph, see below). `0` = the codec's own streaming `batch_decode`, the path the numbers on this page were measured with |
 | `VIENEU_CODEC_DTYPE` | `fp32` | GPU: `bf16` / `fp16` runs the codec decoder in that precision (quantizer stays fp32). Off by default until its audio has been checked; `examples/bench_codec.py` prints correlation/SNR against fp32 |
 | `VIENEU_CODEC_OVERLAP` | 0 | GPU: `1` runs the codec on its own CUDA stream while frames keep being generated (a block's audio goes out one tick later). Measure before keeping it |
@@ -184,6 +185,18 @@ Real costs (RTX 3060, bf16):
 The key point: **the codec is the whole cost**, and it scales with `max_streams` (slots the codec session reserves), not with the streams actually running. That is why `max_streams=32` slows down even a single stream. The codec's built-in `use_cuda_graph` mode is 3x cheaper but produces wrong audio (correlation 0.2 with the plain decode): its session keeps views of the graph's output buffer, so a 4-frame call returns the last frame 4 times.
 
 **Since 2026-10 (`VIENEU_CODEC_GRAPH=1`, the default)** the codec runs through `src/vieneu/v3_turbo_serve/codec_stream.py` instead: the codec's own layers, but a ring KV cache written in place (the codec's session rewrites every layer's whole attention window each frame, for every reserved slot — that is the ~2.5 ms per slot) and one CUDA graph per code frame. Audio matches the plain decode to ~1e-5 in fp32. The numbers on this page were measured **before** that change; compare on your machine with `examples/bench_codec.py` (old vs new codec call) and `VIENEU_CODEC_GRAPH=0` vs `1` with the benchmarks below.
+
+**Since 2026-10-24 (`VIENEU_FASTPATH=1`, the default)** the same model runs through `src/vieneu/v3_turbo_serve/fastpath.py`. The frame above was launch-bound (~2,300 graph nodes at ~1.5 µs each, 5.8 ms whether 1 row or 16); the rewrite keeps the maths and cuts the kernels: norm weights folded into the next projection, fused QKV / gate-up GEMMs, RoPE as one matmul, attention as `baddbmm` + `bmm` with fp32 scores, a top-k + exponential-race sampler, the repetition history updated once per frame. The prompt (embeddings → 12 layers → KV) is one CUDA graph per 32-token bucket (2.2 ms instead of 21–27 ms). The streaming codec gets the same treatment (one table for the quantizer, rotary once per stage, 15 kernels a layer), and both the AR frame and the codec have one graph per slot bucket (1, 2, 4, … `max_streams`), so one listener no longer pays for 16 slots. `infer` decodes whole utterances with `StreamCodec.decode_full` (2–4× faster than the codec's own decode, and exact fp32 — its quantizer convs run in TF32). In fp32 the greedy output is frame-for-frame identical to the old path; in bf16 it is as close to fp32 as the old path was (`tests/fused/cases.py`).
+
+RTX 5060 Ti 16 GB, bf16, Windows, in process, GPU otherwise idle; min / median of 10 runs, `max_streams=16`:
+
+| | `infer` | `infer_stream` TTFA | stream total |
+|---|---|---|---|
+| 1.7 s of audio | 163 / 180 → **71 / 81 ms** | 40 / 50 → **8.4 / 9.0 ms** | 247 / 279 → **92 / 105 ms** |
+| 4.1 s | 350 / 371 → **172 / 185 ms** | 48 / 51 → **9.3 / 9.9 ms** | 628 / 669 → **245 / 259 ms** |
+| 13 s | 748 / 796 → **348 / 380 ms** | 49 / 62 → **11.3 / 12.2 ms** | 1810 / 1895 → **684 / 752 ms** |
+
+(left: `VIENEU_FASTPATH=0`). Per frame at B = 1: 5.8 → 2.8 ms (backbone 1.15, acoustic decoder 0.96, sampling 0.41); codec frame with 1 of 16 slots busy: 4.5 → 1.1 ms. `VIENEU_CODEC_OVERLAP=1` measured slower on this card (two graph streams slow each other down), so it stays off.
 
 The old path (before 2026-09-15): single-sequence engine without CUDA graphs, TTFA 280–360 ms, a lock for the whole utterance → 1 stream, RTF 0.85.
 

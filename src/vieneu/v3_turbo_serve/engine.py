@@ -68,7 +68,8 @@ def _env_int(name: str, default: int) -> int:
 _CODEC_TOKENS_PER_FRAME = 32
 
 
-def decode_rows(tokenizer, codes: List[torch.Tensor], budget_mb: int = 1024) -> List[np.ndarray]:
+def decode_rows(tokenizer, codes: List[torch.Tensor], budget_mb: int = 1024,
+                full_codec=None) -> List[np.ndarray]:
     """Mono float32 waveforms for many rows' codes ``(T_i, n_vq)``.
 
     Same codec decode as one ``decode()`` per row (padding is masked, the
@@ -76,6 +77,12 @@ def decode_rows(tokenizer, codes: List[torch.Tensor], budget_mb: int = 1024) -> 
     first so a group pads little, and a group stays under ``budget_mb`` of
     attention mask (counted at 4 bytes per element; a 300-frame row is
     ~370 MB, a 75-frame row ~23 MB).
+
+    ``full_codec`` (a fast ``codec_stream.StreamCodec``) decodes through
+    ``StreamCodec.decode_full`` instead: same audio (exact fp32, where the
+    codec's own decode runs its quantizer convs in TF32), 2-4x faster. Its
+    groups are capped at ``2 * budget_mb`` padded frames (~0.4 MB of
+    activations per frame).
     """
     out: List[Optional[np.ndarray]] = [None] * len(codes)
     todo = []
@@ -85,6 +92,16 @@ def decode_rows(tokenizer, codes: List[torch.Tensor], budget_mb: int = 1024) -> 
         else:
             out[i] = np.zeros(0, dtype=np.float32)
     todo.sort(key=lambda i: -len(codes[i]))
+    if full_codec is not None:
+        max_frames = max(1, 2 * int(budget_mb))
+        k = 0
+        while k < len(todo):
+            n = max(1, max_frames // len(codes[todo[k]]))
+            group = todo[k:k + n]
+            k += len(group)
+            for i, wav in zip(group, full_codec.decode_full([codes[i] for i in group])):
+                out[i] = wav.numpy().copy()
+        return out
     dev = next(tokenizer.parameters()).device
     budget = max(1, int(budget_mb)) * 2**20
     k = 0
@@ -202,6 +219,11 @@ class V3TurboBatchEngine:
         # VIENEU_FUSED_FRAME=0 falls back to the plain per-op loop.
         self._fused = {}
         self.use_fused = os.environ.get("VIENEU_FUSED_FRAME", "1") != "0"
+        # fastpath.py on top of the fused graphs (fewer kernels per frame, graphed
+        # prefill). VIENEU_FASTPATH=0 keeps fused.py's frame and the HF prefill.
+        from . import fastpath
+        self.use_fastpath = self.use_fused and fastpath.enabled()
+        self._full_codec_obj = None   # see _full_codec
         # Every run overwrites its graph's buffers (static KV cache, codes, flags),
         # so runs must not overlap — infer() is called from several threads by the
         # Gradio app and by servers.
@@ -219,6 +241,22 @@ class V3TurboBatchEngine:
         self.coalescer = _Coalescer(_env_int("VIENEU_MAX_BATCH_ROWS", 32))
         # Attention-mask budget of one batched codec decode (decode_rows).
         self.decode_budget_mb = _env_int("VIENEU_DECODE_BUDGET_MB", 1024)
+
+    def _full_codec(self):
+        """The fast whole-utterance codec decode (``StreamCodec.decode_full``),
+        built on first use; ``None`` off the fast path or for a codec layout
+        it does not know (``decode_rows`` then uses the codec's own decode)."""
+        if not (self.use_fastpath and self.tts.device.type == "cuda"):
+            return None
+        if self._full_codec_obj is None:
+            from .codec_stream import StreamCodec, UnsupportedCodec
+            try:
+                codec = StreamCodec(self.tts.audio_tokenizer, 1, use_graph=False)
+            except UnsupportedCodec as e:
+                logger.warning("v3 Turbo: fast codec decode unavailable (%s)", e)
+                codec = None
+            self._full_codec_obj = codec if codec is not None and codec.fast else False
+        return self._full_codec_obj or None
 
     def _get_graph(self, B, temperature, top_k, top_p):
         key = (B, round(temperature, 4), top_k, round(top_p, 4))
@@ -244,6 +282,21 @@ class V3TurboBatchEngine:
         spk = self.tts._resolve_speaker_emb(req.get("speaker_emb"))
         prompt_2d = self.tts._build_prompt_2d(phonemes, None, ref_codes, style_id)
         return self.model._build_inputs_embeds(prompt_2d.unsqueeze(0).to(self.tts.device), speaker_emb=spk)[0]  # (T, H)
+
+    def _prompt_ids(self, req):
+        """``(ids, spk)`` for the fast path: the prompt as rows of
+        ``fastpath.Prepared.emb_table`` ids on the host (``(T, n_vq+1)``), and
+        the speaker anchor ``(1, D)`` on the device (or ``None``). Same prompt
+        as ``_prompt_embeds``; the embedding happens inside the prefill graph."""
+        from .fastpath import Prepared
+        phonemes = req.get("phonemes")
+        if phonemes is None:
+            from vieneu_utils.phonemize_text import phonemize_text_with_emotions
+            phonemes = phonemize_text_with_emotions(req["text"])
+        ref_codes = req.get("ref_codes") if req.get("use_ref_codes", True) else None
+        spk = self.tts._resolve_speaker_emb(req.get("speaker_emb"))
+        prompt_2d = self.tts._build_prompt_2d(phonemes, None, ref_codes, self.tts._resolve_style_id())
+        return Prepared.of(self.model).prompt_ids(prompt_2d), spk
 
     @torch.no_grad()
     def generate_batch(
@@ -341,7 +394,8 @@ class V3TurboBatchEngine:
                     f"{max_retries} lần thử — giữ bản dài nhất.")
 
         def _decode(rows) -> List[np.ndarray]:
-            return decode_rows(self.tts.audio_tokenizer, rows, self.decode_budget_mb)
+            return decode_rows(self.tts.audio_tokenizer, rows, self.decode_budget_mb,
+                               full_codec=self._full_codec())
 
         wavs: List[np.ndarray] = _decode(codes)
 
@@ -394,6 +448,13 @@ class V3TurboBatchEngine:
         sgs = cfg.speech_generation_start_token_id
         pad = cfg.audio_pad_token_id
         dev = self.tts.device
+
+        if self.use_fastpath and dev.type == "cuda":
+            return self._generate_codes_fastpath(
+                requests, frame_caps, temperature=temperature, top_k=top_k, top_p=top_p,
+                repetition_penalty=repetition_penalty, repetition_window=repetition_window,
+                max_new_frames=max_new_frames,
+            )
 
         embeds_list = [self._prompt_embeds(r) for r in requests]
         B = len(requests)
@@ -475,6 +536,20 @@ class V3TurboBatchEngine:
 
         if not (self.use_fused and self.tts.device.type == "cuda"):
             return 0
+        if self.use_fastpath:
+            from .fastpath import Prefiller, Prepared
+            n = 0
+            with self._fused_lock:
+                for b in batch_sizes:
+                    # Every cache bucket up to ``max_len``: short chunks land in 512.
+                    for needed in range(512, max(512, int(max_len)) + 1, 512):
+                        key = self._fastpath_key(int(b), needed, temperature, top_k, top_p,
+                                                 repetition_penalty, repetition_window)
+                        n += key not in self._fused
+                        self._fastpath_frame(key)
+            # Prompt buckets up to 512 tokens (a 256-char chunk + a long reference).
+            Prefiller.of(Prepared.of(self.model)).warm(512)
+            return n
         max_len = cache_len_bucket(max_len, int(self.config.max_position_embeddings))
         n = 0
         with self._fused_lock:
@@ -549,3 +624,41 @@ class V3TurboBatchEngine:
             h, cache, mask, pos = self.bb.prefill(embeds_p)
             codes = fused.run(h, cache, mask, pos, caps, spk_p, max_new_frames, on_frame=self.frame_hook)
         return codes[:B]   # run() returns clones, safe to use after the lock
+
+    def _fastpath_key(self, B: int, needed: int, temperature, top_k, top_p,
+                      repetition_penalty, repetition_window) -> tuple:
+        """Graph key for ``B`` rows needing a ``needed``-token cache (prompt + frames + 1)."""
+        from .fused import batch_bucket, cache_len_bucket
+        max_len = cache_len_bucket(needed, int(self.config.max_position_embeddings))
+        # key[2:] is the sampling setting the graph LRU (_fused_frame) groups by.
+        return (batch_bucket(B), max_len, round(temperature, 4), int(top_k), round(top_p, 4),
+                round(repetition_penalty, 4), int(repetition_window), "fast")
+
+    def _fastpath_frame(self, key: tuple):
+        from .fastpath import FastBatchFrame, Prepared
+        Bp, max_len, temperature, top_k, top_p, repetition_penalty, repetition_window, _ = key
+        return self._fused_frame(key, lambda: FastBatchFrame(
+            Prepared.of(self.model), Bp, max_len, self.FUSED_MAX_FRAMES,
+            temperature=temperature, top_k=top_k, top_p=top_p,
+            repetition_penalty=repetition_penalty, repetition_window=repetition_window,
+        ))
+
+    @torch.no_grad()
+    def _generate_codes_fastpath(
+        self, requests, frame_caps, *, temperature, top_k, top_p,
+        repetition_penalty, repetition_window, max_new_frames,
+    ) -> List[torch.Tensor]:
+        """``_generate_codes_batch`` through ``fastpath.FastBatchFrame``: each
+        prompt is prefilled by a graph straight into its slot (no HF prefill,
+        no padded batch), spare slots of the power-of-two batch stay idle."""
+        prompts = [self._prompt_ids(r) for r in requests]
+        B = len(prompts)
+        max_new_frames = min(int(max_new_frames), self.FUSED_MAX_FRAMES)
+        caps = [min(int(c), max_new_frames) for c in (frame_caps or [max_new_frames] * B)]
+        T = max(int(ids.shape[0]) for ids, _ in prompts)
+        key = self._fastpath_key(B, T + max_new_frames + 1, temperature, top_k, top_p,
+                                 repetition_penalty, repetition_window)
+        with self._fused_lock:
+            frame = self._fastpath_frame(key)
+            return frame.run([ids for ids, _ in prompts], [spk for _, spk in prompts], caps,
+                             max_new_frames, on_frame=self.frame_hook)
