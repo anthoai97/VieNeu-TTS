@@ -65,6 +65,7 @@ import logging
 import os
 import queue
 import threading
+import time
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -293,7 +294,7 @@ class V3TurboStreamScheduler:
     """Serves many ``infer_stream`` calls from one graph; see the module doc."""
 
     def __init__(self, batch_engine, *, max_streams: int = 16, decode_frames: int = 4,
-                 leadin_frames: int = 2, repetition_window: int = DEFAULT_REP_WINDOW,
+                 leadin_frames: Optional[int] = None, repetition_window: int = DEFAULT_REP_WINDOW,
                  max_admit_per_tick: int = 8):
         self.be = batch_engine
         self.tts = batch_engine.tts
@@ -302,11 +303,18 @@ class V3TurboStreamScheduler:
         self.tok = self.tts.audio_tokenizer
         self.B = max(1, int(max_streams))
         self.K = max(1, int(decode_frames))
+        self.fast = bool(getattr(batch_engine, "use_fastpath", False))
         # A row that has not sent audio yet gets an extra codec call once it
         # has this many frames instead of waiting for the next K boundary.
         # A codec call costs ~65 ms + ~3 ms per reserved slot on a 3060
         # regardless of frame count, so this buys ~2 frames (~20 ms) of
-        # first-audio latency per newcomer for one extra call.
+        # first-audio latency per newcomer for one extra call. On the fast
+        # path a 1-slot codec frame is ~1 ms (RTX 5060 Ti), so the first
+        # audio goes out after one frame (a ~90-char sentence: TTFA median
+        # 14.4 → 11.3 ms) and the next block still lands with >= 46 ms of
+        # playback to spare.
+        if leadin_frames is None:
+            leadin_frames = 1 if self.fast else 2
         self.leadin = max(1, min(int(leadin_frames), self.K))
         # Note: an idle GPU drops to its lowest power state within ~2 s (RTX
         # 3060: P8, 210 MHz) and the first request after that pays +100..300 ms
@@ -321,8 +329,15 @@ class V3TurboStreamScheduler:
         # that read and fits the default 256-char chunks (longer ones are refused).
         max_pos = int(self.cfg.max_position_embeddings)
         self.max_len = min(max_pos, max(256, _env_int("VIENEU_STREAM_MAX_LEN", max_pos)))
-        self.frame = StreamFrame(self.model, self.B, self.max_len,
-                                 repetition_window=self.repetition_window)
+        # fastpath.FastStreamFrame: same slots and ring, fewer kernels per frame,
+        # and a request's prompt is prefilled by a graph straight into its slot.
+        if self.fast:
+            from . import fastpath
+            self.frame = fastpath.FastStreamFrame(fastpath.Prepared.of(self.model), self.B, self.max_len,
+                                                  repetition_window=self.repetition_window)
+        else:
+            self.frame = StreamFrame(self.model, self.B, self.max_len,
+                                     repetition_window=self.repetition_window)
         # One codec slot per scheduler slot (codec_stream.py). None: the codec's
         # own streaming batch_decode, which keeps rows in ``_codec_rows`` order.
         self.codec: Optional[StreamCodec] = None
@@ -464,7 +479,33 @@ class V3TurboStreamScheduler:
             h.q.put(err)
             unanswered.remove(h)
 
+        def place(h: StreamHandle, b: int) -> None:
+            h.slot = b
+            h.decoded_upto = h.f0
+            self._slots[b] = h
+            unanswered.remove(h)
+            if h.req["max_new_frames"] == 0:
+                # Nothing to generate: finished before its first frame.
+                h.finished_at = h.f0
+                h.gen_done.set()
+            self._codec_rows.append(h)
+
         try:
+            if self.fast:
+                for h in todo:
+                    r = h.req
+                    try:
+                        ids, spk = self.be._prompt_ids(r)
+                        h.f0 = self.frame.admit_prompt(
+                            free[0], ids, spk, r["max_new_frames"],
+                            temperature=r["temperature"], top_k=r["top_k"], top_p=r["top_p"],
+                            repetition_penalty=r["repetition_penalty"],
+                        )
+                    except Exception as err:   # noqa: BLE001
+                        reject(h, err)
+                        continue
+                    place(h, free.pop(0))
+                return
             batch: List[StreamHandle] = []
             embeds, spks = [], []
             for h in todo:
@@ -501,15 +542,7 @@ class V3TurboStreamScheduler:
                     free.insert(0, b)
                     reject(h, err)
                     continue
-                h.slot = b
-                h.decoded_upto = h.f0
-                self._slots[b] = h
-                unanswered.remove(h)
-                if r["max_new_frames"] == 0:
-                    # Nothing to generate: finished before its first frame.
-                    h.finished_at = h.f0
-                    h.gen_done.set()
-                self._codec_rows.append(h)
+                place(h, b)
         except BaseException as err:
             for h in unanswered:
                 h.q.put(err)
@@ -517,7 +550,16 @@ class V3TurboStreamScheduler:
 
     def _step(self) -> None:
         self._flush(wait=False)
-        self.frame.replay()
+        busy = [b for b, h in enumerate(self._slots) if h is not None and h.finished_at is None]
+        if not busy and self._codec_rows:
+            # Every row has all its frames: decode the tails now rather than
+            # stepping idle frames up to the next K boundary.
+            self._decode()
+            return
+        if busy and hasattr(self.frame, "buckets"):
+            self.frame.replay(1 + max(busy))     # only the slots up to the last busy one
+        else:
+            self.frame.replay()
         self.tick += 1
         st = self.frame.status()
         fin, length = st[:self.B], st[self.B:]
@@ -555,7 +597,10 @@ class V3TurboStreamScheduler:
             mask = torch.zeros(len(active), self.B, dtype=torch.bool)
             for f, slots in enumerate(active):
                 mask[f, list(slots)] = True
-            block = self.codec.launch_block(blk, mask.to(blk.device))   # audio (F, B, 3840)
+            # Slots are handed out lowest-first, so the busy ones are a prefix
+            # and the codec only computes up to the highest one (its bucket).
+            n_active = 1 + max(max(slots) for slots in active if slots)
+            block = self.codec.launch_block(blk, mask.to(blk.device), n_active)   # audio (F, B, 3840)
         # Bookkeeping now (a finished row's slot is free for the next admit);
         # the audio itself is handed out by _flush, in order, then the end mark.
         deliveries = []
@@ -590,6 +635,10 @@ class V3TurboStreamScheduler:
                 h.q.put(audio[a:b, slot].reshape(-1).copy())
             if final:
                 h.q.put(None)
+        if deliveries:
+            # Let the listeners' threads take the GIL now: otherwise a waiting
+            # consumer may only get it at the next switch interval (5 ms).
+            time.sleep(0)
 
     @torch.no_grad()
     def _decode_moss(self) -> None:

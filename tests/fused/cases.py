@@ -235,7 +235,7 @@ def test_infer_stream_serves_concurrent_callers_and_matches_full_decode():
     streamed = np.concatenate(list(h))
     idx = torch.remainder(torch.arange(h.f0, h.f0 + h.frames, device="cuda"), sched.frame.ring)
     row_codes = sched.frame.codes.index_select(0, idx)[:, h.slot].cpu()
-    full = tts.engine._decode_codes(row_codes)
+    full = _full_decode(tts.engine.audio_tokenizer, row_codes).numpy()
     assert len(streamed) == len(full) == h.frames * 3840
     assert np.abs(streamed - full).max() < 1e-3
 
@@ -303,9 +303,18 @@ def _moss_codec(device: str):
 
 
 def _full_decode(tok, codes_tn: torch.Tensor) -> torch.Tensor:
-    """Decode thường (không streaming) của mã ``(T, n_vq)`` → mono ``(T*3840,)``."""
-    with torch.no_grad():
-        out = tok.decode(codes_tn.T.unsqueeze(1).to(next(tok.parameters()).device), return_dict=True)
+    """Decode thường (không streaming) của mã ``(T, n_vq)`` → mono ``(T*3840,)``.
+
+    Tắt TF32 của cuDNN khi decode: các conv 1x1 của quantizer chạy TF32 (mặc
+    định của PyTorch) lệch tới ~3e-3 so với fp32 thật trên GPU Ampere+, tuỳ
+    thuật toán cuDNN chọn theo batch — mốc so sánh phải là fp32 thật."""
+    tf32 = torch.backends.cudnn.allow_tf32
+    torch.backends.cudnn.allow_tf32 = False
+    try:
+        with torch.no_grad():
+            out = tok.decode(codes_tn.T.unsqueeze(1).to(next(tok.parameters()).device), return_dict=True)
+    finally:
+        torch.backends.cudnn.allow_tf32 = tf32
     return out.audio[0].float().mean(0).cpu()
 
 
@@ -655,3 +664,146 @@ def test_static_prefill_matches_hf_prefill(device):
             v = (layer.values if layer is not None else cache.value_cache[l])[r, :, T - Ti:]
             assert keys[r][l].shape == k.shape
             assert torch.allclose(k, keys[r][l], atol=1e-4) and torch.allclose(v, values[r][l], atol=1e-4)
+
+
+# ── fast path (fastpath.py, codec_stream fast stages): same maths, fewer kernels ──
+
+def _fast_reqs(tts):
+    voice = tts.get_preset_voice()
+    reqs = [{"text": t, "speaker_emb": voice["speaker_emb"], "ref_codes": voice["codes"]}
+            for t in ["Xin chào các bạn.", "Hôm nay trời đẹp quá, mình đi dạo nhé.", "Ba."]]
+    reqs.append({"text": "Không có mã tham chiếu.", "speaker_emb": voice["speaker_emb"],
+                 "ref_codes": voice["codes"], "use_ref_codes": False})
+    return reqs
+
+
+def test_fast_sampler_top_k_then_top_p_greedy_and_nan():
+    """Top-k rồi top-p trên phân phối top-k đã chuẩn hoá lại (quy tắc của
+    ``_sample_token``), greedy khi temperature 0, top-k riêng từng row, và mã
+    luôn nằm trong [0, V) kể cả khi logits là NaN (slot chết của batch liên tục)."""
+    from vieneu.v3_turbo_serve.fastpath import RowSampling, Sampler
+    torch.manual_seed(0)
+    V = 8
+    raw = torch.tensor([[10.0, 9.0, 8.5, -5.0, -6.0, -7.0, -8.0, -9.0]])
+    hyp = torch.ones(1, 1)
+    samp = RowSampling(1, V, "cpu")
+    samp.set_all(0.8, 2, 0.95, 1.0)
+    s2 = Sampler(1, V, 2, "cpu")
+    assert {int(s2(raw, hyp, 0, samp, None)) for _ in range(200)} == {0, 1}
+    # top-3 renormalised = (0.63, 0.23, 0.14): top_p=0.3 keeps only the best.
+    samp.set_all(1.0, 3, 0.3, 1.0)
+    s3 = Sampler(1, V, 3, "cpu")
+    assert {int(s3(raw, hyp, 0, samp, None)) for _ in range(50)} == {0}
+    samp.set_all(0.0, 25, 0.95, 1.0)
+    assert int(Sampler(1, V, 25, "cpu")(raw, hyp, 0, samp, None)) == 0
+    rows = RowSampling(2, V, "cpu")
+    rows.set_row(0, 0.8, 1, 1.0, 1.0)     # top-1
+    rows.set_row(1, 0.8, 0, 1.0, 1.0)     # top-k off
+    sr = Sampler(2, V, None, "cpu")
+    got = torch.stack([sr(raw.repeat(2, 1), torch.ones(2, 1), 0, rows, None) for _ in range(300)])
+    assert set(got[:, 0].tolist()) == {0}
+    assert {0, 1, 2} <= set(got[:, 1].tolist())
+    out = sr(torch.full((2, V), float("nan")), torch.ones(2, 1), 0, rows, None)
+    assert ((out >= 0) & (out < V)).all()
+
+
+def test_fast_rep_matches_gpu_history():
+    """``FastRep`` (một lần mỗi frame cho mọi codebook) == ``GpuRepHistory``,
+    kể cả row vào giữa chừng."""
+    from vieneu.v3_turbo_serve.fastpath import FastRep
+    B, n_vq, V, window = 2, 3, 16, 4
+    fast = FastRep(B, n_vq, V, window, torch.device("cpu"))
+    ref = GpuRepHistory(B, n_vq, V, window, torch.device("cpu"))
+    rng = random.Random(5)
+    for f in range(20):
+        if f == 7:
+            fast.reset_rows(torch.tensor([1]))
+            ref.reset_rows(torch.tensor([1]))
+        codes = torch.tensor([[rng.randrange(6) for _ in range(n_vq)] for _ in range(B)])
+        fast.add_frame(codes)
+        for ch in range(n_vq):
+            ref.add(ch, codes[:, ch])
+        ref.advance()
+        assert torch.equal(fast.counts, ref.counts), f
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_baddbmm32_expands_a_broadcast_bias():
+    """torch 2.8: ``baddbmm(out_dtype=...)`` không broadcast bias mà trả về
+    batch của bias — ``_baddbmm32`` phải tự expand."""
+    from vieneu.v3_turbo_serve.fastpath import _baddbmm32
+    a = torch.randn(6, 2, 8, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(6, 8, 3, device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn(1, 2, 3, device="cuda")
+    got = _baddbmm32(bias, a, b, 0.5)
+    assert got.shape == (6, 2, 3) and got.dtype == torch.float32
+    assert torch.allclose(got, bias + 0.5 * (a.float() @ b.float()), atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_fast_prefill_and_step_match_the_fused_path_in_fp32():
+    """Prefill bằng graph (``Prefiller``, embedding trong graph) và bước giải mã
+    ``FastBackbone`` == ``StaticBackbone`` (fp32: ~1e-6)."""
+    from vieneu.v3_turbo_serve import fastpath as FP
+    from vieneu.v3_turbo_serve.fused import StaticBackbone
+    tts = _tts_fp32("cuda")
+    eng = tts._get_batch_engine()
+    reqs = _fast_reqs(tts)
+    n = len(reqs)
+    embeds = [eng._prompt_embeds(r) for r in reqs]
+    h_ref, keys, values = StaticBackbone(eng.model, n, 1024).prefill(embeds)
+    prep = FP.Prepared.of(eng.model)
+    pf = FP.Prefiller.of(prep)
+    new, old = FP.FastBackbone(prep, n, 1024), StaticBackbone(eng.model, n, 1024)
+    for r, req in enumerate(reqs):
+        ids, spk = eng._prompt_ids(req)
+        with pf.lock:
+            T, Tb = pf.run(ids, spk)
+            assert T == embeds[r].shape[0]
+            assert torch.allclose(pf.h_last, h_ref[r], atol=1e-4, rtol=1e-4)
+            for l in range(prep.n_layers):
+                assert torch.allclose(pf.k[l, :, Tb - T:Tb], keys[r][l], atol=1e-4)
+                assert torch.allclose(pf.v[l, :, Tb - T:Tb], values[r][l], atol=1e-4)
+            new.load_row(r, 0, T, pf.k[:, :, Tb - T:Tb], pf.v[:, :, Tb - T:Tb])
+        old.load_row(r, keys[r], values[r])
+    H = prep.H
+    for _ in range(6):
+        x = torch.randn(n, H, device="cuda") * 0.5
+        assert torch.allclose(new.step(x), old.step(x.view(n, 1, H)), atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_fast_greedy_generation_matches_the_fused_path_in_fp32():
+    """Cả vòng sinh greedy (phạt lặp bật) qua ``FastBatchFrame`` == ``FusedFrame``:
+    cùng mã từng frame, cùng độ dài."""
+    from vieneu.v3_turbo_serve import fastpath as FP
+    from vieneu.v3_turbo_serve.fused import FusedFrame
+    tts = _tts_fp32("cuda")
+    eng = tts._get_batch_engine()
+    reqs = _fast_reqs(tts)
+    samp = dict(temperature=0.0, top_k=25, top_p=0.95, repetition_penalty=1.2, repetition_window=64)
+    embeds = [eng._prompt_embeds(r) for r in reqs]
+    h, cache, mask, pos = eng.bb.prefill(embeds)
+    spk = torch.cat([tts.engine._resolve_speaker_emb(r["speaker_emb"]) for r in reqs])
+    want = FusedFrame(eng.model, 4, 1024, 512, **samp).run(h, cache, mask, pos, [200] * 4, spk, 200)
+    prompts = [eng._prompt_ids(r) for r in reqs]
+    got = FP.FastBatchFrame(FP.Prepared.of(eng.model), 4, 1024, 512, **samp).run(
+        [p[0] for p in prompts], [p[1] for p in prompts], [200] * 4, 200)
+    for a, b in zip(want, got):
+        assert a.shape == b.shape and torch.equal(a.cpu(), b.cpu())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_stream_codec_slot_buckets_match_full_width():
+    """Chỉ tính các slot bận (bucket theo ``n_active``) cho đúng audio như tính đủ B slot."""
+    from vieneu.v3_turbo_serve.codec_stream import StreamCodec
+    tok = _moss_codec("cuda")
+    torch.manual_seed(4)
+    codes = torch.randint(0, 1024, (30, 8, 16), device="cuda")
+    act = torch.zeros(30, 8, dtype=torch.bool, device="cuda")
+    act[:, :3] = True
+    full, part = StreamCodec(tok, 8), StreamCodec(tok, 8)
+    assert part.fast and part.buckets == [1, 2, 4, 8]
+    a = full.decode_block(codes, act)
+    b = part.decode_block(codes, act, n_active=3)
+    assert (a[:, :3] - b[:, :3]).abs().max().item() < 1e-5

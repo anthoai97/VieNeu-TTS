@@ -43,10 +43,30 @@ codec's own ``set_compute_dtype``; the quantizer stays fp32.
 ``launch_block`` returns at once and the caller's stream keeps running
 (``stream.py`` keeps generating frames meanwhile); ``CodecBlock.result()``
 waits for the audio.
+
+Fast path (fp32, ``VIENEU_FASTPATH`` != 0; RTX 5060 Ti, 2026-10-24): a frame
+was 2.6 ms for 1 slot and 4.5 ms for 16, ~45 kernels a layer — the codec's
+RoPE alone recomputes its frequencies and cos/sin in ~25 kernels per layer,
+and its 16-codebook quantizer runs 16 weight-normed 1x1 convs per frame. Now:
+
+* the quantizer is one precomputed table per codebook (codebook → its
+  ``out_proj`` → the shared ``output_proj``; all linear, so exact up to
+  summation order) and a frame's 16 codes are one ``embedding_bag``;
+* per stage, once per frame: the sliding-window mask as an additive bias,
+  the scatter index and the rotary angles (the codec's own formula), applied
+  to q and k of every layer as one complex multiply;
+* per layer: the attention scale (1/8, exact) folded into ``in_proj``, both
+  layer scales into the projection before them, residual adds into ``addmm``,
+  attention as ``baddbmm`` + softmax + ``bmm`` — 15 kernels;
+* one graph per slot bucket (1, 2, 4, ...): a step for slots ``[:n]`` only
+  computes those, so one listener costs a 1-slot frame. ``stream.py`` hands
+  out the lowest free slot, so the busy slots are a prefix.
 """
 from __future__ import annotations
 
 import contextlib
+import math
+import os
 from typing import List, Optional
 
 import torch
@@ -79,7 +99,7 @@ class CodecBlock:
 class _Stage:
     """One projected transformer of the decoder plus its ring KV caches."""
 
-    def __init__(self, module, T: int, B: int, device, dtype):
+    def __init__(self, module, T: int, B: int, device, dtype, fast: bool = False):
         tr = getattr(module, "transformer", None)
         layers = list(getattr(tr, "layers", []))
         if not layers or getattr(tr, "positional_embedding", None) != "rope":
@@ -101,6 +121,114 @@ class _Stage:
         self.offset = torch.zeros(B, device=device, dtype=torch.long)
         self._t = torch.arange(self.T, device=device)
         self._r = torch.arange(self.R, device=device)
+        self.fast = bool(fast)
+        if self.fast:
+            self._prepare_fast(device)
+
+    @torch.no_grad()
+    def _prepare_fast(self, device) -> None:
+        a0 = self.layers[0].self_attn
+        rope = getattr(a0, "rope", None)
+        if rope is None:
+            raise UnsupportedCodec("decoder attention without rope")
+        D = self.D
+        # apply_rope's own frequencies, same expression.
+        ds = torch.arange(D // 2, device=device, dtype=torch.float32)
+        self.freqs = torch.exp(ds * (-math.log(rope.max_period) * 2 / D))
+        self._tf = self._t.float()
+        self._one = torch.ones(1, device=device)
+        self.wqkv, self.wo, self.w1, self.w2 = [], [], [], []
+        for layer in self.layers:
+            a = layer.self_attn
+            ffn = layer.ffn
+            if (a.in_proj.bias is not None or a.out_proj.bias is not None
+                    or not isinstance(ffn, torch.nn.Sequential) or len(ffn) != 3
+                    or not isinstance(ffn[1], torch.nn.GELU) or ffn[0].bias is not None
+                    or ffn[2].bias is not None):
+                raise UnsupportedCodec("decoder layer layout")
+
+            def scale(ls):
+                s = getattr(ls, "scale", None)
+                return torch.ones(self.E, device=device) if s is None else s.detach().float()
+
+            w = a.in_proj.weight.detach().float().clone()
+            w[:self.E] *= D ** -0.5                   # SDPA's default scale, exact (1/8)
+            self.wqkv.append(w)
+            self.wo.append(a.out_proj.weight.detach().float() * scale(layer.layer_scale_1).view(-1, 1))
+            self.w1.append(ffn[0].weight.detach().float())
+            self.w2.append(ffn[2].weight.detach().float() * scale(layer.layer_scale_2).view(-1, 1))
+            if ffn[1].approximate != "none":
+                raise UnsupportedCodec("tanh GELU")
+
+    def forward_fast(self, x: torch.Tensor, exec_mask: torch.Tensor, n: int) -> torch.Tensor:
+        """``forward`` for slots ``[:n]`` with this module's arithmetic (fp32)."""
+        m = self.module
+        H, D, T, R, E = self.H, self.D, self.T, self.R, self.E
+        x = m.input_proj(x.transpose(1, 2))                         # (n, T, E)
+        off = self.offset[:n]
+        pos_q = off.view(-1, 1) + self._t                           # (n, T)
+        end = pos_q[:, -1:]
+        pos_k = end - torch.remainder(end - self._r, R)             # (n, R)
+        delta = pos_q.unsqueeze(-1) - pos_k.unsqueeze(1)            # (n, T, R)
+        ok = (pos_k >= 0).unsqueeze(1) & (delta >= 0) & (delta < self.ctx)
+        bias = torch.zeros(n, 1, T, R, device=x.device).masked_fill_(~ok.unsqueeze(1), float("-inf"))
+        bias = bias.expand(n, H, T, R).reshape(n * H, T, R)
+        idx = torch.remainder(pos_q, R).view(n, 1, T, 1).expand(n, H, T, D)
+        ts = off.float().view(-1, 1) + self._tf                     # (n, T)
+        rot = torch.polar(self._one, self.freqs * ts.view(n, T, 1)).view(1, n, 1, T, D // 2)
+        for i, layer in enumerate(self.layers):
+            x = self._layer_fast(i, layer, x, bias, rot, idx, n)
+        self.offset[:n].copy_(torch.where(exec_mask, off + T, off))
+        return m.output_proj(x).transpose(1, 2)
+
+    def _layer_fast(self, i: int, layer, x, bias, rot, idx, n: int) -> torch.Tensor:
+        H, D, T, R, E = self.H, self.D, self.T, self.R, self.E
+        qkv = F.linear(layer.norm1(x), self.wqkv[i]).view(n, T, 3, H, D)
+        # q and k as complex pairs (re, im) = (x[2j], x[2j+1]), rotated together.
+        qk = torch.view_as_complex(qkv[:, :, :2].permute(2, 0, 3, 1, 4).unflatten(-1, (D // 2, 2)))
+        qk = torch.view_as_real(qk * rot).flatten(-2)               # (2, n, H, T, D)
+        kc, vc = self.k[i, :n], self.v[i, :n]                       # (n, H, R, D)
+        kc.scatter_(2, idx, qk[1])
+        vc.scatter_(2, idx, qkv[:, :, 2].permute(0, 2, 1, 3))
+        s = torch.baddbmm(bias, qk[0].reshape(n * H, T, D), kc.view(n * H, R, D).transpose(1, 2))
+        o = torch.bmm(torch.softmax(s, dim=-1), vc.view(n * H, R, D))
+        o = o.view(n, H, T, D).transpose(1, 2).reshape(n * T, E)
+        x2 = torch.addmm(x.reshape(n * T, E), o, self.wo[i].t())
+        f = F.gelu(F.linear(layer.norm2(x2), self.w1[i]))
+        return torch.addmm(x2, f, self.w2[i].t()).view(n, T, E)
+
+    @torch.no_grad()
+    def forward_full(self, x: torch.Tensor, block: int = 512) -> torch.Tensor:
+        """The whole sequence at once (non-streaming decode, positions from 0):
+        ``x`` (B, C, Ts) → (B, C', Ts). Causal sliding-window attention in
+        query blocks of ``block`` tokens; same arithmetic as ``forward_fast``."""
+        m = self.module
+        H, D, E, ctx = self.H, self.D, self.E, self.ctx
+        x = m.input_proj(x.transpose(1, 2))                         # (B, Ts, E)
+        B, Ts = x.shape[0], x.shape[1]
+        t = torch.arange(Ts, device=x.device)
+        rot = torch.polar(self._one, self.freqs * t.float().view(Ts, 1)).view(1, 1, 1, Ts, D // 2)
+        spans = []
+        for q0 in range(0, Ts, block):
+            q1 = min(Ts, q0 + block)
+            k0 = max(0, q0 - ctx + 1)
+            delta = t[q0:q1].view(-1, 1) - t[k0:q1].view(1, -1)
+            bias = torch.zeros(delta.shape, device=x.device).masked_fill_((delta < 0) | (delta >= ctx), float("-inf"))
+            spans.append((q0, q1, k0, bias.unsqueeze(0)))
+        for i, layer in enumerate(self.layers):
+            qkv = F.linear(layer.norm1(x), self.wqkv[i]).view(B, Ts, 3, H, D)
+            qk = torch.view_as_complex(qkv[:, :, :2].permute(2, 0, 3, 1, 4).unflatten(-1, (D // 2, 2)))
+            qk = torch.view_as_real(qk * rot).flatten(-2)           # (2, B, H, Ts, D)
+            q, k = qk[0].reshape(B * H, Ts, D), qk[1].reshape(B * H, Ts, D)
+            v = qkv[:, :, 2].permute(0, 2, 1, 3).reshape(B * H, Ts, D)
+            o = [torch.bmm(torch.softmax(torch.baddbmm(bias.expand(B * H, -1, -1), q[:, q0:q1],
+                                                       k[:, k0:q1].transpose(1, 2)), dim=-1), v[:, k0:q1])
+                 for q0, q1, k0, bias in spans]
+            o = (o[0] if len(o) == 1 else torch.cat(o, dim=1)).view(B, H, Ts, D).transpose(1, 2).reshape(B * Ts, E)
+            x2 = torch.addmm(x.reshape(B * Ts, E), o, self.wo[i].t())
+            f = F.gelu(F.linear(layer.norm2(x2), self.w1[i]))
+            x = torch.addmm(x2, f, self.w2[i].t()).view(B, Ts, E)
+        return m.output_proj(x).transpose(1, 2)
 
     def forward(self, x: torch.Tensor, exec_mask: torch.Tensor) -> torch.Tensor:
         """``x`` (B, C, T) conv layout → (B, C', T); advances the ``exec`` slots."""
@@ -145,7 +273,8 @@ class StreamCodec:
     """
 
     def __init__(self, tokenizer, B: int, *, compute_dtype: Optional[torch.dtype] = None,
-                 use_graph: Optional[bool] = None, overlap: bool = False, warmup: int = 2):
+                 use_graph: Optional[bool] = None, overlap: bool = False, warmup: int = 2,
+                 fast: Optional[bool] = None):
         model = tokenizer
         p = next(model.parameters())
         dev = p.device
@@ -160,24 +289,38 @@ class StreamCodec:
             raise UnsupportedCodec("codec quantizer has no num_quantizers")
         self.autocast_dtype = compute_dtype if (dev.type == "cuda" and compute_dtype not in (None, torch.float32)) else None
         cache_dtype = self.autocast_dtype or p.dtype
+        # The fast arithmetic is written for fp32 (the codec's own dtype); a
+        # bf16/fp16 decoder keeps the module path under autocast.
+        if fast is None:
+            fast = os.environ.get("VIENEU_FASTPATH", "1") != "0"
+        self.fast = bool(fast) and self.autocast_dtype is None and p.dtype == torch.float32
 
         # The decoder is patch (upsample) modules and projected transformers;
         # a transformer's tokens per code frame = product of the patches before it.
-        self._plan: list = []
-        self.stages: List[_Stage] = []
-        t = 1
-        for mod in model.decoder:
-            if hasattr(mod, "transformer") and hasattr(mod, "input_proj"):
-                stage = _Stage(mod, t, self.B, dev, cache_dtype)
-                self.stages.append(stage)
-                self._plan.append(("stage", stage))
-            elif hasattr(mod, "patch_size") and hasattr(mod, "decode"):
-                t *= int(mod.patch_size)
-                self._plan.append(("patch", mod))
-            else:
-                raise UnsupportedCodec(f"unknown decoder module {type(mod).__name__}")
-        if not self.stages:
-            raise UnsupportedCodec("codec decoder has no transformer")
+        def build(fast_stages: bool):
+            plan, stages, t = [], [], 1
+            for mod in model.decoder:
+                if hasattr(mod, "transformer") and hasattr(mod, "input_proj"):
+                    stage = _Stage(mod, t, self.B, dev, cache_dtype, fast=fast_stages)
+                    stages.append(stage)
+                    plan.append(("stage", stage))
+                elif hasattr(mod, "patch_size") and hasattr(mod, "decode"):
+                    t *= int(mod.patch_size)
+                    plan.append(("patch", mod))
+                else:
+                    raise UnsupportedCodec(f"unknown decoder module {type(mod).__name__}")
+            if not stages:
+                raise UnsupportedCodec("codec decoder has no transformer")
+            return plan, stages
+
+        if self.fast:
+            try:
+                self._plan, self.stages = build(True)
+                self._prepare_quantizer(quantizer)
+            except UnsupportedCodec:
+                self.fast = False
+        if not self.fast:
+            self._plan, self.stages = build(False)
 
         self.codes = torch.zeros(self.n_vq, self.B, 1, device=dev, dtype=torch.long)
         self.exec = torch.zeros(self.B, device=dev, dtype=torch.bool)
@@ -187,26 +330,69 @@ class StreamCodec:
         self._host: Optional[torch.Tensor] = None   # pinned copy of ``_mono`` (overlap)
         self._last: Optional[CodecBlock] = None
         self.stream = torch.cuda.Stream(device=dev) if (overlap and dev.type == "cuda") else None
+        # Slot buckets: a fast step over slots [:n] computes only those.
+        self.buckets = [self.B]
+        if self.fast:
+            self.buckets = [1 << i for i in range(self.B.bit_length()) if (1 << i) < self.B] + [self.B]
 
         self.graph = None
+        self.graphs = {}
         if use_graph is None:
             use_graph = dev.type == "cuda"
         with torch.no_grad():
+            self._frame(self.B)   # allocates ``out`` with its real shape
             if use_graph:
                 # Warm-up and capture with every slot idle: offsets stay put and
                 # the ring writes are overwritten by each slot's first real frame.
-                s = torch.cuda.Stream()
-                s.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(s):
-                    for _ in range(max(1, warmup)):
-                        self._frame()
-                torch.cuda.current_stream().wait_stream(s)
-                self.graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(self.graph):
-                    self._frame()
-            else:
-                self._frame()   # allocates ``out`` with its real shape
+                pool = torch.cuda.graph_pool_handle()
+                for n in self.buckets:
+                    s = torch.cuda.Stream()
+                    s.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(s):
+                        for _ in range(max(1, warmup) if not self.graphs else 1):
+                            self._frame(n)
+                    torch.cuda.current_stream().wait_stream(s)
+                    g = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(g, pool=pool):
+                        self._frame(n)
+                    self.graphs[n] = g
+                self.graph = self.graphs[self.B]
         self.reset()
+
+    @torch.no_grad()
+    def _prepare_quantizer(self, quantizer) -> None:
+        """Per-codebook tables of the whole quantizer decode (fp32):
+        ``decode_codes(c) == sum_i table[i][c_i] + const`` — codebook row →
+        that codebook's ``out_proj`` → the shared ``output_proj``, all linear."""
+        def conv_wb(conv):
+            if not isinstance(conv, torch.nn.Conv1d) or tuple(conv.kernel_size) != (1,):
+                raise UnsupportedCodec("quantizer projections are not 1x1 convs")
+            w = conv.weight.detach().float()[:, :, 0]          # (out, in); weight norm applied
+            b = conv.bias.detach().float() if conv.bias is not None else w.new_zeros(w.shape[0])
+            return w, b
+
+        qs = list(getattr(quantizer, "quantizers", []))[:self.n_vq]
+        if len(qs) != self.n_vq or any(not hasattr(q, "codebook") for q in qs):
+            raise UnsupportedCodec("quantizer layout")
+        tables, bias = [], None
+        for q in qs:
+            t = q.codebook.weight.detach().float()             # (V, d)
+            if not isinstance(q.out_proj, torch.nn.Identity):
+                w, b = conv_wb(q.out_proj)
+                t = t @ w.t()
+                bias = b if bias is None else bias + b
+            tables.append(t)
+        tables = torch.stack(tables)                           # (n_vq, V, rvq)
+        const = tables.new_zeros(tables.shape[-1]) if bias is None else bias
+        out = getattr(quantizer, "output_proj", torch.nn.Identity())
+        if not isinstance(out, torch.nn.Identity):
+            wo, bo = conv_wb(out)
+            tables = tables @ wo.t()
+            const = const @ wo.t() + bo
+        V = tables.shape[1]
+        self._q_table = tables.reshape(-1, tables.shape[-1]).contiguous()
+        self._q_const = const.contiguous()
+        self._q_offsets = (torch.arange(self.n_vq, device=tables.device) * V).view(1, -1)
 
     # ── the frame ─────────────────────────────────────────────────────────────
     def _autocast(self):
@@ -214,23 +400,70 @@ class StreamCodec:
             return contextlib.nullcontext()
         return torch.autocast(device_type="cuda", dtype=self.autocast_dtype)
 
-    def _frame(self) -> None:
+    def _frame(self, n: Optional[int] = None) -> None:
+        """One code frame for slots ``[:n]`` (every slot on the module path)."""
         model = self.model
-        x = model.quantizer.decode_codes(self.codes).float()      # (B, C, 1)
-        with self._autocast():
+        if not self.fast:
+            n = self.B
+            x = model.quantizer.decode_codes(self.codes).float()      # (B, C, 1)
+            with self._autocast():
+                for kind, mod in self._plan:
+                    if kind == "patch":
+                        x, _ = mod(x, self._lengths)
+                    else:
+                        x = mod.forward(x, self.exec)
+        else:
+            n = self.B if n is None else n
+            ids = self.codes[:, :n, 0].t() + self._q_offsets            # (n, n_vq)
+            x = (F.embedding_bag(ids, self._q_table, mode="sum") + self._q_const).unsqueeze(-1)
+            lengths, exec_mask = self._lengths[:n], self.exec[:n]
             for kind, mod in self._plan:
                 if kind == "patch":
-                    x, _ = mod(x, self._lengths)
+                    x, _ = mod(x, lengths)
                 else:
-                    x = mod.forward(x, self.exec)
-        audio, _ = model._restore_channels_from_codec(x, self._lengths)   # (B, ch, 3840) fp32
+                    x = mod.forward_fast(x, exec_mask, n)
+        audio, _ = model._restore_channels_from_codec(x, self._lengths[:n])   # (n, ch, 3840) fp32
         if self.out is None:
             self.out = torch.zeros_like(audio)
-        self.out.copy_(audio)
+        self.out[:n].copy_(audio)
+
+    @torch.no_grad()
+    def decode_full(self, codes: List[torch.Tensor]) -> List[torch.Tensor]:
+        """Non-streaming decode of whole rows ``(T_i, n_vq)`` → mono float32
+        audio ``(T_i * 3840,)`` on the host, every row in one pass. Rows are
+        padded at the end (the decoder is causal: padding never reaches earlier
+        samples). Fast stages only; no slot state is touched.
+
+        Replaces the codec's own ``batch_decode`` for whole utterances: on an
+        RTX 5060 Ti that took 24 ms for 55 frames (~3,700 eager ops, and its
+        1x1 quantizer convs run in TF32 — ~3e-3 off fp32)."""
+        if not self.fast:
+            raise RuntimeError("decode_full needs the fast stages (fp32 codec, VIENEU_FASTPATH != 0)")
+        lens = [int(c.shape[0]) for c in codes]
+        B, T = len(codes), max(lens)
+        ids = torch.nn.utils.rnn.pad_sequence([c.to(self.device, torch.long) for c in codes], batch_first=True)
+        x = F.embedding_bag((ids + self._q_offsets.view(1, 1, -1)).view(B * T, self.n_vq), self._q_table, mode="sum")
+        x = (x + self._q_const).view(B, T, -1).transpose(1, 2)            # (B, C, T)
+        lengths = torch.full((B,), T, device=self.device, dtype=torch.long)
+        for kind, mod in self._plan:
+            if kind == "patch":
+                x, lengths = mod(x, lengths)
+            else:
+                x = mod.forward_full(x)
+        audio, _ = self.model._restore_channels_from_codec(x, lengths)       # (B, ch, T * 3840)
+        mono = audio.mean(1).cpu()
+        return [mono[b, :lens[b] * SAMPLES_PER_FRAME] for b in range(B)]
 
     def _on_stream(self):
         """Where every codec op runs: its own stream with ``overlap``, else the caller's."""
         return torch.cuda.stream(self.stream) if self.stream is not None else contextlib.nullcontext()
+
+    def bucket(self, n_active: Optional[int]) -> int:
+        """Smallest slot bucket covering slots ``[:n_active]`` (all of them for ``None``)."""
+        if n_active is None:
+            return self.B
+        n = max(1, int(n_active))
+        return next(b for b in self.buckets if b >= n)
 
     # ── public ────────────────────────────────────────────────────────────────
     @torch.no_grad()
@@ -251,42 +484,50 @@ class StreamCodec:
                 st.offset.index_fill_(0, idx, 0)
 
     @torch.no_grad()
-    def step(self, codes: torch.Tensor, exec_mask: torch.Tensor) -> torch.Tensor:
+    def step(self, codes: torch.Tensor, exec_mask: torch.Tensor, n_active: Optional[int] = None) -> torch.Tensor:
         """One code frame for every slot.
 
         ``codes`` (n_vq, B) long, ``exec_mask`` (B,) bool — the slots that
-        really have a frame now. Returns the static ``(B, channels, 3840)``
+        really have a frame now. With ``n_active``, no slot from there on may
+        be active: only slots ``[:bucket(n_active)]`` are computed (the rest
+        of the output is stale). Returns the static ``(B, channels, 3840)``
         output buffer, overwritten by the next call.
         """
         self.codes[:, :, 0].copy_(codes)
         self.exec.copy_(exec_mask)
-        if self.graph is not None:
-            self.graph.replay()
+        n = self.bucket(n_active)
+        if self.graphs:
+            self.graphs[n].replay()
         else:
-            self._frame()
+            self._frame(n)
         return self.out
 
     @torch.no_grad()
-    def decode_block(self, codes: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
+    def decode_block(self, codes: torch.Tensor, active: torch.Tensor,
+                     n_active: Optional[int] = None) -> torch.Tensor:
         """``codes`` (F, B, n_vq) and ``active`` (F, B) bool, both on the codec's
         device → mono float32 audio ``(F, B, 3840)`` on the host. Slot ``b``'s
         frame ``f`` is decoded only where ``active[f, b]``; its audio is
         meaningless elsewhere."""
-        return self.launch_block(codes, active).result()
+        return self.launch_block(codes, active, n_active).result()
 
     @torch.no_grad()
-    def launch_block(self, codes: torch.Tensor, active: torch.Tensor) -> CodecBlock:
+    def launch_block(self, codes: torch.Tensor, active: torch.Tensor,
+                     n_active: Optional[int] = None) -> CodecBlock:
         """``decode_block`` that does not wait for the audio when ``overlap``
-        is on. The previous block's audio is secured first (it shares buffers)."""
+        is on. The previous block's audio is secured first (it shares buffers).
+        ``n_active`` as in ``step``."""
         if self._last is not None:
             self._last.result()
             self._last = None
         n = int(codes.shape[0])
+        nb = self.bucket(n_active)
         if self._mono is None or self._mono.shape[0] < n:
             self._mono = torch.zeros(n, self.B, self.out.shape[-1], device=self.device, dtype=torch.float32)
         if self.stream is None:
             for f in range(n):
-                torch.mean(self.step(codes[f].transpose(0, 1), active[f]), dim=1, out=self._mono[f])
+                out = self.step(codes[f].transpose(0, 1), active[f], nb)
+                torch.mean(out[:nb], dim=1, out=self._mono[f, :nb])
             # ``copy=True``: on a CPU codec ``.cpu()`` would hand out the buffer itself.
             return CodecBlock(None, self._mono[:n].to("cpu", copy=True))
         if self._host is None or self._host.shape[0] < n:
@@ -298,7 +539,8 @@ class StreamCodec:
             codes.record_stream(self.stream)
             active.record_stream(self.stream)
             for f in range(n):
-                torch.mean(self.step(codes[f].transpose(0, 1), active[f]), dim=1, out=self._mono[f])
+                out = self.step(codes[f].transpose(0, 1), active[f], nb)
+                torch.mean(out[:nb], dim=1, out=self._mono[f, :nb])
             self._host[:n].copy_(self._mono[:n], non_blocking=True)
             done = torch.cuda.Event()
             done.record(self.stream)
